@@ -2,12 +2,15 @@ import os
 import sys
 import soxr
 import time
+import json
 import torch
 import librosa
 import logging
+import concurrent.futures
 import numpy as np
 import soundfile as sf
 import noisereduce as nr
+from functools import partial
 from pedalboard import (
     Pedalboard,
     Chorus,
@@ -27,7 +30,7 @@ sys.path.append(now_dir)
 
 from rvc.infer.pipeline import Pipeline as VC
 from rvc.lib.utils import load_audio_infer, load_embedding
-from rvc.lib.tools.split_audio import process_audio, merge_audio
+from rvc.lib.tools.split_audio import process_audio, merge_audio, parallel_inference_mapping
 from rvc.lib.algorithm.synthesizers import Synthesizer
 from rvc.configs.config import Config
 
@@ -115,6 +118,7 @@ class VoiceConverter:
                     32000,
                     44100,
                     48000,
+                    64000,
                 ]
                 target_sr = min(common_sample_rates, key=lambda x: abs(x - sample_rate))
                 audio = librosa.resample(
@@ -218,29 +222,6 @@ class VoiceConverter:
     ):
         """
         Performs voice conversion on the input audio.
-
-        Args:
-            pitch (int): Key for F0 up-sampling.
-            index_rate (float): Rate for index matching.
-            volume_envelope (int): RMS mix rate.
-            protect (float): Protection rate for certain audio segments.
-            hop_length (int): Hop length for audio processing.
-            f0_method (str): Method for F0 extraction.
-            audio_input_path (str): Path to the input audio file.
-            audio_output_path (str): Path to the output audio file.
-            model_path (str): Path to the voice conversion model.
-            index_path (str): Path to the index file.
-            split_audio (bool): Whether to split the audio for processing.
-            f0_autotune (bool): Whether to use F0 autotune.
-            clean_audio (bool): Whether to clean the audio.
-            clean_strength (float): Strength of the audio cleaning.
-            export_format (str): Format for exporting the audio.
-            f0_file (str): Path to the F0 file.
-            embedder_model (str): Path to the embedder model.
-            embedder_model_custom (str): Path to the custom embedder model.
-            resample_sr (int, optional): Resample sampling rate. Default is 0.
-            sid (int, optional): Speaker ID. Default is 0.
-            **kwargs: Additional keyword arguments.
         """
         if not model_path:
             print("No model path provided. Aborting conversion.")
@@ -277,36 +258,40 @@ class VoiceConverter:
         if self.tgt_sr != resample_sr >= 16000:
             self.tgt_sr = resample_sr
 
+        # Generate chunk slices and sample boundaries
+        intervals = None
         if split_audio:
             chunks, intervals = process_audio(audio, 16000)
             print(f"Audio split into {len(chunks)} chunks for processing.")
         else:
-            chunks = []
-            chunks.append(audio)
+            chunks = [audio]
 
-        converted_chunks = []
-        for c in chunks:
-            audio_opt = self.vc.pipeline(
-                model=self.hubert_model,
-                net_g=self.net_g,
-                sid=sid,
-                audio=c,
-                pitch=pitch,
-                f0_method=f0_method,
-                file_index=file_index,
-                index_rate=index_rate,
-                pitch_guidance=self.use_f0,
-                volume_envelope=volume_envelope,
-                version=self.version,
-                protect=protect,
-                f0_autotune=f0_autotune,
-                f0_autotune_strength=f0_autotune_strength,
-                proposed_pitch=proposed_pitch,
-                proposed_pitch_threshold=proposed_pitch_threshold,
-            )
-            converted_chunks.append(audio_opt)
-            if split_audio:
-                print(f"Converted audio chunk {len(converted_chunks)}")
+        # Assemble global parameters to send down to execution channels
+        pipeline_kwargs = {
+            "pitch": pitch,
+            "f0_method": f0_method,
+            "file_index": file_index,
+            "index_rate": index_rate,
+            "pitch_guidance": self.use_f0,
+            "volume_envelope": volume_envelope,
+            "version": self.version,
+            "protect": protect,
+            "f0_autotune": f0_autotune,
+            "f0_autotune_strength": f0_autotune_strength,
+            "proposed_pitch": proposed_pitch,
+            "proposed_pitch_threshold": proposed_pitch_threshold,
+        }
+
+        # --- ROUTE INFERENCE TO THE TRUE PARALLELISM PIPELINE MAPPER ---
+        converted_chunks = parallel_inference_mapping(
+            inference_worker_func=self.vc.pipeline,
+            full_audio=audio,
+            chunks=chunks,
+            intervals=intervals,
+            sr=16000,
+            split_audio_enabled=split_audio,
+            **pipeline_kwargs
+        )
 
         if split_audio:
             audio_opt = merge_audio(
@@ -337,6 +322,15 @@ class VoiceConverter:
             audio_output_path, output_path_format, export_format
         )
 
+        # Force unbinding references to cleanly unlock file descriptors on Windows systems
+        del audio
+        del chunks
+        del converted_chunks
+        if 'audio_opt' in locals():
+            del audio_opt
+        import gc
+        gc.collect()
+
         elapsed_time = time.time() - start_time
         print(
             f"Conversion completed at '{audio_output_path}' in {elapsed_time:.2f} seconds."
@@ -350,13 +344,6 @@ class VoiceConverter:
     ):
         """
         Performs voice conversion on a batch of input audio files.
-
-        Args:
-            audio_input_paths (str): List of paths to the input audio files.
-            audio_output_path (str): Path to the output audio file.
-            resample_sr (int, optional): Resample sampling rate. Default is 0.
-            sid (int, optional): Speaker ID. Default is 0.
-            **kwargs: Additional keyword arguments.
         """
         pid = os.getpid()
         try:
@@ -403,15 +390,12 @@ class VoiceConverter:
             elapsed_time = time.time() - start_time
             print(f"Batch conversion completed in {elapsed_time:.2f} seconds.")
         finally:
-            os.remove(os.path.join(now_dir, "assets", "infer_pid.txt"))
+            if os.path.exists(os.path.join(now_dir, "assets", "infer_pid.txt")):
+                os.remove(os.path.join(now_dir, "assets", "infer_pid.txt"))
 
     def get_vc(self, weight_root, sid):
         """
         Loads the voice conversion model and sets up the pipeline.
-
-        Args:
-            weight_root (str): Path to the model weights.
-            sid (int): Speaker ID.
         """
         if sid == "" or sid == []:
             self.cleanup_model()
@@ -446,9 +430,6 @@ class VoiceConverter:
     def load_model(self, weight_root):
         """
         Loads the model weights from the specified path.
-
-        Args:
-            weight_root (str): Path to the model weights.
         """
         self.cpt = (
             torch.load(weight_root, map_location="cpu", weights_only=True)
