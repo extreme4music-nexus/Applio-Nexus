@@ -3,6 +3,8 @@ import json
 import numpy as np
 import librosa
 import concurrent.futures
+import psutil
+import torch
 from functools import partial
 
 def process_audio(audio, sr=16000, silence_thresh=-60, min_silence_len=250):
@@ -75,99 +77,181 @@ def load_saved_parallel_config():
     return False, False, None
 
 
-def parallel_inference_mapping(inference_worker_func, full_audio, chunks, intervals, sr, split_audio_enabled, **kwargs):
+def load_saved_device_config():
+    """Reads the stored hardware processing device target from disk."""
+    now_dir = os.getcwd()
+    config_path = os.path.join(now_dir, "assets", "device_config.json")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data.get("device", "cpu")
+        except Exception:
+            pass
+    return "cpu"
+
+
+def parallel_inference_mapping(inference_worker_func, model, net_g, sid, full_audio, chunks, intervals, sr, split_audio_enabled, **kwargs):
     """
-    Orchestrates execution workflow. Pre-calculates global pitch arrays over the 
-    entire un-split audio if pitch locking is active, slices both arrays, 
-    and handles true process parallelism safely.
+    Advanced Background Orchestration Engine. Evaluates the tracking pitch offset on the first 
+    active audio chunk using core native librosa utilities, profiles system memory ceilings, 
+    and schedules parallel worker arrays inside safe execution group pipelines.
     """
     saved_parallel, saved_lock_pitch, saved_workers = load_saved_parallel_config()
+    saved_device = load_saved_device_config().lower()
     
     ui_parallel_enabled = (os.environ.get("APPLIO_PARALLEL", "false").lower() == "true") or saved_parallel
     ui_lock_pitch_enabled = (os.environ.get("APPLIO_PARALLEL_LOCK_PITCH", "false").lower() == "true") or saved_lock_pitch
 
-    # --- FALLBACK PATH: SEQUENTIAL EXECUTION LOOP ---
+    # Extract standard baseline parameters safely out of trailing variables
+    pitch = kwargs.pop("pitch", 0)
+    proposed_pitch_active = kwargs.get("proposed_pitch", False)
+    proposed_pitch_threshold = kwargs.get("proposed_pitch_threshold", 155.0)
+
+    # --- FALLBACK PATH: NATIVE SEQUENTIAL EXECUTION LOOP ---
     if not ui_parallel_enabled or not split_audio_enabled:
-        print("[Parallel Engine] Parallelism off or Split Audio unselected. Falling back to default mode.")
+        print("[Parallel Engine] Parallel optimization disabled or Split Audio unchecked. Running default loop.")
         converted_chunks = []
         try:
             for i, c in enumerate(chunks):
-                audio_opt = inference_worker_func(audio=c, **kwargs)
+                audio_opt = inference_worker_func(model, net_g, sid, c, pitch, **kwargs)
                 converted_chunks.append(audio_opt)
             return converted_chunks
         finally:
-            if 'audio_opt' in locals(): 
-                del audio_opt
+            if 'audio_opt' in locals(): del audio_opt
 
-    # --- TRUE PARALLELISM PATH: GLOBAL PITCH PRE-CALCULATION ENGINE ---
-    total_chunks = len(chunks)
-    max_workers = min(total_chunks, 12)
+    print(f"[Parallel Engine] Orchestrator online. Total chunks to process: {len(chunks)}")
+
+    # --- NEW OPTIMIZATION: FIRST VOCAL CHUNK PITCH CALCULATION & TRANSPOSITION LOCK ---
+    worker_proposed_pitch = proposed_pitch_active
+
+    if ui_lock_pitch_enabled and proposed_pitch_active and len(chunks) > 0:
+        print("[Parallel Engine] Force Uniform Pitch Active. Scanning for first active vocal chunk to establish master baseline offset...")
+        
+        # Locate the first chunk that isn't just silence/noise to ensure accurate pitch analysis
+        target_chunk = chunks[0]
+        for c in chunks:
+            if np.abs(c).max() > 0.01:
+                target_chunk = c
+                break
+                
+        try:
+            # Use native librosa.pyin (built into all environments) for safe fundamental frequency tracking
+            # Restrict frequency search bounds safely to standard human vocal performance ranges (65Hz - 1000Hz)
+            f0, voiced_flag, voiced_probs = librosa.pyin(
+                target_chunk, 
+                fmin=librosa.note_to_hz('C2'), 
+                fmax=librosa.note_to_hz('C6'), 
+                sr=sr,
+                hop_length=160
+            )
+            
+            # Extract valid tracking vectors
+            valid_f0 = f0[~np.isnan(f0) & (f0 > 0)]
+            f0_cohesive = np.median(valid_f0) if len(valid_f0) > 0 else 0.0
+            
+            if 0 < f0_cohesive < proposed_pitch_threshold:
+                # Apply standard logarithmic semitone shift distance formulas
+                calculated_offset = int(np.round(12 * np.log2(proposed_pitch_threshold / f0_cohesive)))
+                pitch = pitch + calculated_offset
+                print(f"[Parallel Engine] First chunk tracking complete. Applied uniform transposition shift: {calculated_offset} semitones.")
+            else:
+                print("[Parallel Engine] First voice chunk range is already optimal. Maintaining default baseline keys.")
+            
+            # Disable chunk-level pitch detection for all chunks to maximize speed
+            worker_proposed_pitch = False
+            kwargs["proposed_pitch"] = False
+        except Exception as pyin_err:
+            print(f"[Parallel Engine] Warning: Native chunk pitch tracking encountered an error ({pyin_err}). Falling back to chunk-level tracking.")
+
+    # --- THE BACKGROUND HARDWARE PROFILE MANAGER (ANTI-OOM CEILING SCANNER) ---
+    logical_cores = os.cpu_count() or 1
+    available_sys_ram_gb = psutil.virtual_memory().available / (1024 ** 3)
+    
+    max_workers = min(len(chunks), logical_cores)
     if saved_workers is not None:
         try:
-            max_workers = int(saved_workers)
+            max_workers = min(int(saved_workers), logical_cores)
         except ValueError:
             pass
-    
-    lock_status = "ACTIVE" if ui_lock_pitch_enabled else "INACTIVE"
-    print(f"[Parallel Engine] Optimization active. Chunks: {total_chunks}, Workers: {max_workers}, Global Pitch Lock: {lock_status}")
-    
-    sliced_pitch_chunks = [None] * total_chunks
 
-    if ui_lock_pitch_enabled and kwargs.get("proposed_pitch", False):
-        print("[Parallel Engine] Performing global pitch calculations on full audio stream before chunk allocation...")
-        
-        # Extract user threshold constraints safely from passed kwargs
-        pitch_method = kwargs.get("f0method", "pm")
-        pitch_th = kwargs.get("proposed_pitch_threshold", 0.0) # Read user set pitch threshold
-        hop_length = 160  # Default hop length used across standard RVC pipelines
-        
-        # Dynamically import the native pitch extraction tool from Applio's backend
+    is_gpu_mode = "cpu" not in saved_device and (torch.cuda.is_available() or "cuda" in saved_device)
+    
+    if is_gpu_mode:
         try:
-            from rvc.lib.predictors.F0Predictor import get_f0_predictor
-            # Instantiate the chosen pitch algorithm handler
-            predictor = get_f0_predictor(pitch_method, hop_length=hop_length, sampling_rate=sr)
+            device_idx = 0
+            if "cuda:" in saved_device:
+                device_idx = int(saved_device.split(":")[-1].split(" ")[0])
+            vram_free_gb = torch.cuda.mem_get_info(device_idx)[0] / (1024 ** 3)
             
-            # Compute the global f0 pitch array across the complete, unbroken audio stream
-            global_f0, _ = predictor.compute_f0(full_audio, pitch_th)
-            
-            # Convert intervals from audio sample indices to matching f0 feature frame indices
-            # Audio index maps to frame index via: frame = sample / hop_length
-            for i, (start_sample, end_sample) in enumerate(intervals):
-                start_frame = int(start_sample / hop_length)
-                end_frame = int(end_sample / hop_length)
-                # Slice the pre-calculated global pitch array cleanly with absolute context preservation
-                sliced_pitch_chunks[i] = global_f0[start_frame:end_frame]
+            # Defensive Footprint Budget Mapping: Allocate ~1.25 GB VRAM ceiling per worker process
+            estimated_safe_gpu_workers = int(vram_free_gb // 1.25)
+            if estimated_safe_gpu_workers < 1:
+                estimated_safe_gpu_workers = 1
                 
-            print("[Parallel Engine] Global pitch envelope computed and sliced successfully across chunk targets.")
-        except Exception as pitch_err:
-            print(f"[Parallel Engine] Warning: Failed to compute global pitch pre-calculation ({pitch_err}). Falling back to local chunk calculation.")
+            max_workers = min(max_workers, estimated_safe_gpu_workers)
+            print(f"[Parallel Engine] Target backend: GPU. Available VRAM: {vram_free_gb:.2f} GB. Max safe concurrent workers: {max_workers}")
+        except Exception:
+            max_workers = min(max_workers, 2)
+            print(f"[Parallel Engine] Hardware device query failed. Throttling concurrent worker capacity safely to: {max_workers}")
+    else:
+        # Defensive Footprint Budget Mapping: Allocate ~1.15 GB system RAM weight per core worker
+        estimated_safe_cpu_workers = int(available_sys_ram_gb // 1.15)
+        if estimated_safe_cpu_workers < 1:
+            estimated_safe_cpu_workers = 1
+            
+        # Keep 2 core threads open so system/Gradio processes don't freeze or lag
+        safe_core_ceiling = max(1, logical_cores - 2)
+        max_workers = min(max_workers, estimated_safe_cpu_workers, safe_core_ceiling)
+        print(f"[Parallel Engine] Target backend: CPU. Available RAM: {available_sys_ram_gb:.2f} GB. Max safe concurrent workers: {max_workers}")
 
-    # --- CONCURRENT WORKER DISPATCH LOOP ---
+    # --- ADVANCED BATCHED EXECUTION GROUP ORCHESTRATION ---
+    total_chunks = len(chunks)
+    converted_chunks_map = {}
+    
+    # Group chunk arrays cleanly into safe chunks matching our calculated memory limits
+    chunk_groups = [chunks[x:x+max_workers] for x in range(0, total_chunks, max_workers)]
+    print(f"[Parallel Engine] Divided work into {len(chunk_groups)} execution group blocks to prevent out-of-memory issues.")
+
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
-            for i, chunk in enumerate(chunks):
-                # Copy global keyword parameters for each distinct worker
-                worker_kwargs = kwargs.copy()
-                
-                # If global pitch array exists for this chunk, inject it directly and disable local recalculation
-                if sliced_pitch_chunks[i] is not None:
-                    worker_kwargs["f0_precalculated"] = sliced_pitch_chunks[i]
-                    worker_kwargs["proposed_pitch"] = False  # Tells worker loop to bypass extraction step
-
-                # Queue the worker thread execution target
-                futures.append(executor.submit(inference_worker_func, audio=chunk, **worker_kwargs))
+        global_index_tracker = 0
+        for group_idx, current_group in enumerate(chunk_groups):
+            print(f"[Parallel Engine] Processing Execution Group [{group_idx + 1}/{len(chunk_groups)}] (Size: {len(current_group)} chunks)...")
             
-            # Wait and gather execution responses sequentially to ensure audio array ordering matches
-            results = [f.result() for f in futures]
-        return results
-        
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(current_group)) as executor:
+                futures = []
+                for chunk in current_group:
+                    worker_kwargs = kwargs.copy()
+                    worker_kwargs["proposed_pitch"] = worker_proposed_pitch
+                    
+                    futures.append(executor.submit(
+                        inference_worker_func,
+                        model,
+                        net_g,
+                        sid,
+                        chunk,
+                        pitch,
+                        **worker_kwargs
+                    ))
+                
+                for future in futures:
+                    result_audio = future.result()
+                    converted_chunks_map[global_index_tracker] = result_audio
+                    global_index_tracker += 1
+                    
+            if is_gpu_mode:
+                torch.cuda.empty_cache()
+
+        # Rebuild final output array sequencing perfectly matching original timeline locations
+        final_results = [converted_chunks_map[idx] for idx in range(total_chunks)]
+        print("[Parallel Engine] All execution batches completed successfully. Merging chunks.")
+        return final_results
+
     except Exception as e:
-        print(f"[Parallel Engine] Critical failure inside thread mapping execution queue: {e}")
+        print(f"[Parallel Engine] Critical failure inside asynchronous group worker processing: {e}")
         raise e
     finally:
-        # Aggressive memory cleanup behaviors to prevent thread-bound OOM conditions
         if 'futures' in locals(): del futures
-        if 'sliced_pitch_chunks' in locals(): del sliced_pitch_chunks
+        if 'converted_chunks_map' in locals(): del converted_chunks_map
         import gc
         gc.collect()
