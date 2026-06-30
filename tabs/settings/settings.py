@@ -24,6 +24,7 @@ except AttributeError:
     pass
 
 try:
+    # FIXED: Replaced os.execv with os.execl to resolve argument passing TypeErrors
     _orig_execl = os.execl
     def _patched_execl(executable, *args):
         _clean_cuda_mask_before_restart()
@@ -79,17 +80,12 @@ def save_device(device_string):
 def apply_device_patch_to_backend(device_string):
     """Forces currently running memory modules and variables to update instantly."""
     clean_device = device_string.split(" ")[0].lower()
-    
-    # Sync environment flag for external backend tasks
     os.environ["APPLIO_DEVICE"] = clean_device
     
-    # --- SUBPROCESS MASK FOR TRAINING BACKEND ---
     if "cpu" in clean_device:
         os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-        print("[Hardware Selector] CPU Mode activated. Masking GPU for all background training tasks.")
     else:
         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-        print(f"[Hardware Selector] GPU Acceleration enabled. Active target: {clean_device}")
     
     for mod_name, mod in list(sys.modules.items()):
         if "config" in mod_name or "rvc" in mod_name:
@@ -106,9 +102,7 @@ def apply_device_patch_to_backend(device_string):
 
 
 def load_saved_parallel():
-    """Reads the permanently stored parallelism selection from disk.
-    Returns a tuple containing (parallel_bool, lock_pitch_bool)
-    """
+    """Reads the permanently stored parallelism selection from disk."""
     if os.path.exists(PARALLEL_CONFIG_PATH):
         try:
             with open(PARALLEL_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -134,18 +128,9 @@ def apply_parallel_patch_to_backend(parallel_bool, lock_pitch_bool):
     os.environ["APPLIO_PARALLEL"] = str(parallel_bool).lower()
     os.environ["APPLIO_PARALLEL_LOCK_PITCH"] = str(lock_pitch_bool).lower()
     
-    # Clear out any hard global environment caps so Applio can handle num_workers natively
     os.environ.pop("OMP_NUM_THREADS", None)
     os.environ.pop("MKL_NUM_THREADS", None)
     os.environ.pop("OPENBLAS_NUM_THREADS", None)
-    os.environ.pop("VECLIB_MAXIMUM_THREADS", None)
-    os.environ.pop("NUMEXPR_NUM_THREADS", None)
-    
-    if not parallel_bool:
-        print("[Parallelism Selector] Custom parallelism optimization disabled. Applio default num_workers active.")
-    else:
-        lock_status = "Enabled" if lock_pitch_bool else "Disabled"
-        print(f"[Parallelism Selector] Parallel multi-threading capabilities active. Pitch Locking: {lock_status}")
     
     for mod_name, mod in list(sys.modules.items()):
         if "config" in mod_name or "rvc" in mod_name:
@@ -174,26 +159,28 @@ except ImportError:
 
 if RVCConfig is not None:
     try:
-        original_init = RVCConfig.__init__
-        def patched_init(self, *args, **kwargs):
-            original_init(self, *args, **kwargs)
+        # STABILIZATION LOCK: Check flag properties to prevent nested infinite recursion loops
+        if not hasattr(RVCConfig, "_is_patched_by_fork"):
+            RVCConfig._is_patched_by_fork = True
+            original_init = RVCConfig.__init__
             
-            # Load and apply Hardware settings
-            saved_device = load_saved_device()
-            if saved_device:
-                clean_dev = saved_device.split(" ")[0].lower()
-                self.device = clean_dev
-                if "cpu" in clean_dev:
-                    self.is_half = False
-                    
-            # Load and apply Parallelism settings
-            saved_parallel, saved_lock_pitch = load_saved_parallel()
-            self.parallel = saved_parallel
-            self.parallel_lock_pitch = saved_lock_pitch
-            apply_parallel_patch_to_backend(saved_parallel, saved_lock_pitch)
-            
-        RVCConfig.__init__ = patched_init
-        print("[Hardware & Parallelism Selector] Permanent RVC backend hooks bound successfully.")
+            def patched_init(self, *args, **kwargs):
+                original_init(self, *args, **kwargs)
+                
+                saved_device = load_saved_device()
+                if saved_device:
+                    clean_dev = saved_device.split(" ")[0].lower()
+                    self.device = clean_dev
+                    if "cpu" in clean_dev:
+                        self.is_half = False
+                        
+                saved_parallel, saved_lock_pitch = load_saved_parallel()
+                self.parallel = saved_parallel
+                self.parallel_lock_pitch = saved_lock_pitch
+                apply_parallel_patch_to_backend(saved_parallel, saved_lock_pitch)
+                
+            RVCConfig.__init__ = patched_init
+            print("[Hardware & Parallelism Selector] Permanent baseline initialization hooks bound cleanly.")
     except Exception as e:
         print(f"[Hardware & Parallelism Selector] Failed to bind startup hook: {e}")
 
@@ -217,7 +204,11 @@ def get_available_devices():
 
 
 def change_device_target(selected_device):
-    """Fired immediately when the dropdown option changes in the UI."""
+    """Fired immediately when the dropdown option changes in the UI with a debounce cache check."""
+    cached_preference = load_saved_device()
+    if cached_preference == selected_device:
+        return  # Deduplicate out-of-order event loops
+        
     save_device(selected_device)
     apply_device_patch_to_backend(selected_device)
     print(f"[Hardware Selector] Device configuration locked to: {selected_device}")
@@ -225,7 +216,11 @@ def change_device_target(selected_device):
 
 
 def change_parallel_target(selected_parallel, selected_lock_pitch):
-    """Fired immediately when the parallelism checkboxes change."""
+    """Fired immediately when the parallelism checkboxes change with a debounce cache check."""
+    cached_p, cached_l = load_saved_parallel()
+    if cached_p == selected_parallel and cached_l == selected_lock_pitch:
+        return  # Deduplicate out-of-order event loops
+        
     save_parallel(selected_parallel, selected_lock_pitch)
     apply_parallel_patch_to_backend(selected_parallel, selected_lock_pitch)
     print(f"[Parallelism Selector] State updated - Parallel: {selected_parallel}, Lock Pitch: {selected_lock_pitch}")
@@ -288,7 +283,6 @@ def settings_tab(filter_state_trigger=None):
             
             system_devices = get_available_devices()
             
-            # Read previously saved choice on layout generation, otherwise default to CUDA/CPU
             saved_preference = load_saved_device()
             if saved_preference in system_devices:
                 initial_selection = saved_preference
