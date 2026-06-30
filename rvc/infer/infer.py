@@ -258,7 +258,7 @@ class VoiceConverter:
         if self.tgt_sr != resample_sr >= 16000:
             self.tgt_sr = resample_sr
 
-        # Generate chunk slices and sample boundaries
+        # Generate chunk slices and sample boundaries cleanly
         intervals = None
         if split_audio:
             chunks, intervals = process_audio(audio, 16000)
@@ -266,9 +266,9 @@ class VoiceConverter:
         else:
             chunks = [audio]
 
-        # Assemble global parameters to send down to execution channels
+        # Assemble processing parameter mappings safely
         pipeline_kwargs = {
-            "pitch": pitch,
+            "pitch": pitch, 
             "f0_method": f0_method,
             "file_index": file_index,
             "index_rate": index_rate,
@@ -282,9 +282,12 @@ class VoiceConverter:
             "proposed_pitch_threshold": proposed_pitch_threshold,
         }
 
-        # --- ROUTE INFERENCE TO THE TRUE PARALLELISM PIPELINE MAPPER ---
+        # --- ROUTE INFERENCE TO THE ADVANCED BACKGROUND CONCURRENCY ORCHESTRATOR ---
         converted_chunks = parallel_inference_mapping(
             inference_worker_func=self.vc.pipeline,
+            model=self.hubert_model,
+            net_g=self.net_g,
+            sid=sid,
             full_audio=audio,
             chunks=chunks,
             intervals=intervals,
