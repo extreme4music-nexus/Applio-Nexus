@@ -69,6 +69,7 @@ from tabs.voice_blender.voice_blender import voice_blender_tab
 from tabs.plugins.plugins import plugins_tab
 from tabs.settings.settings import settings_tab
 from tabs.realtime.realtime import realtime_tab
+from tabs.tensorboard.tensorboard import tensorboard_tab
 
 # Run prerequisites
 from core import run_prerequisites_script
@@ -167,6 +168,9 @@ with gr.Blocks(
     with gr.Tab(i18n("Settings")):
         settings_tab()
 
+    with gr.Tab(i18n("TensorBoard")):
+        tensorboard_tab()
+
     gr.Markdown("""
     <div style="text-align: center; font-size: 0.9em; text-color: a3a3a3;">
     By using Applio, you agree to comply with ethical and legal standards, respect intellectual property and privacy rights, avoid harmful or prohibited uses, and accept full responsibility for any outcomes, while Applio disclaims liability and reserves the right to amend these terms.
@@ -198,6 +202,43 @@ def launch_gradio(server_name: str, server_port: int) -> None:
             else {}
         ),
     )
+
+    # Mount TensorBoard proxy so it's accessible from any origin
+    from rvc.lib.tools.launch_tensorboard import get_tb_url
+    import httpx
+    from fastapi import Request, Response
+
+    @app.api_route(
+        "/tensorboard/{path:path}",
+        methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
+    )
+    @app.api_route(
+        "/tensorboard",
+        methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
+    )
+    async def tb_proxy(request: Request, path: str = ""):
+        tb_url = get_tb_url()
+        if not tb_url:
+            return Response("TensorBoard not started", status_code=503)
+        url = f"{tb_url.rstrip('/')}/{path}"
+        if request.url.query:
+            url = f"{url}?{request.url.query}"
+        async with httpx.AsyncClient() as client:
+            resp = await client.request(
+                method=request.method,
+                url=url,
+                headers={
+                    k: v
+                    for k, v in request.headers.items()
+                    if k.lower() not in ["host"]
+                },
+                content=await request.body(),
+            )
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            media_type=resp.headers.get("content-type"),
+        )
 
     if client_mode:
         import time
