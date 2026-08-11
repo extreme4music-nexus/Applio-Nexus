@@ -27,9 +27,9 @@ async def change_config(ws: WebSocket):
     text = await ws.receive_text()
     jsons = json.loads(text)
 
-    if jsons["if_kwargs"]:
+    if jsons["if_kwargs"] and jsons["value"] is not None:
         params["kwargs"][jsons["key"]] = jsons["value"]
-    else:
+    elif jsons["value"] is not None:
         params[jsons["key"]] = jsons["value"]
 
     crossfade_frame = int(
@@ -267,14 +267,13 @@ async def websocket_audio(ws: WebSocket):
         text = await ws.receive_text()
         params = json.loads(text)
 
-        read_chunk_size = int(params["chunk_size"])
-        block_frame = read_chunk_size * 128
+        block_frame = params["block_frame"]
 
         print("Starting Realtime...")
 
         if vc_instance is None:
             vc_instance = VoiceChanger(
-                read_chunk_size=read_chunk_size,
+                block_frame=block_frame,
                 cross_fade_overlap_size=params["cross_fade_overlap_size"],
                 extra_convert_size=params["extra_convert_size"],
                 model_path=params["model_path"],
