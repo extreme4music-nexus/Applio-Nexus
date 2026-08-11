@@ -2,15 +2,12 @@ import os
 import sys
 import soxr
 import time
-import json
 import torch
 import librosa
 import logging
-import concurrent.futures
 import numpy as np
 import soundfile as sf
 import noisereduce as nr
-from functools import partial
 from pedalboard import (
     Pedalboard,
     Chorus,
@@ -30,7 +27,11 @@ sys.path.append(now_dir)
 
 from rvc.infer.pipeline import Pipeline as VC
 from rvc.lib.utils import load_audio_infer, load_embedding
-from rvc.lib.tools.split_audio import process_audio, merge_audio, parallel_inference_mapping
+from rvc.lib.tools.split_audio import (
+    process_audio,
+    merge_audio,
+    parallel_inference_mapping,
+)
 from rvc.lib.algorithm.synthesizers import Synthesizer
 from rvc.configs.config import Config
 
@@ -268,7 +269,7 @@ class VoiceConverter:
 
         # Assemble processing parameter mappings safely
         pipeline_kwargs = {
-            "pitch": pitch, 
+            "pitch": pitch,
             "f0_method": f0_method,
             "file_index": file_index,
             "index_rate": index_rate,
@@ -293,7 +294,7 @@ class VoiceConverter:
             intervals=intervals,
             sr=16000,
             split_audio_enabled=split_audio,
-            **pipeline_kwargs
+            **pipeline_kwargs,
         )
 
         if split_audio:
@@ -329,9 +330,10 @@ class VoiceConverter:
         del audio
         del chunks
         del converted_chunks
-        if 'audio_opt' in locals():
+        if "audio_opt" in locals():
             del audio_opt
         import gc
+
         gc.collect()
 
         elapsed_time = time.time() - start_time

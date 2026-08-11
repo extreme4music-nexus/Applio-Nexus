@@ -4,21 +4,25 @@ import json
 import gradio as gr
 import torch
 
-# Fix reboot bug: clear any inherited CPU-masking from a previous session 
+# Fix reboot bug: clear any inherited CPU-masking from a previous session
 # before torch/CUDA can initialize and cache the device environment state.
 if os.environ.get("CUDA_VISIBLE_DEVICES") == "-1":
     os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+
 
 # Also intercept runtime process replacement (reboot) to ensure clean inheritance
 def _clean_cuda_mask_before_restart():
     if os.environ.get("CUDA_VISIBLE_DEVICES") == "-1":
         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
+
 try:
     _orig_execv = os.execv
+
     def _patched_execv(executable, args):
         _clean_cuda_mask_before_restart()
         return _orig_execv(executable, args)
+
     os.execv = _patched_execv
 except AttributeError:
     pass
@@ -26,9 +30,11 @@ except AttributeError:
 try:
     # FIXED: Replaced os.execv with os.execl to resolve argument passing TypeErrors
     _orig_execl = os.execl
+
     def _patched_execl(executable, *args):
         _clean_cuda_mask_before_restart()
         return _orig_execl(executable, *args)
+
     os.execl = _patched_execl
 except AttributeError:
     pass
@@ -81,12 +87,12 @@ def apply_device_patch_to_backend(device_string):
     """Forces currently running memory modules and variables to update instantly."""
     clean_device = device_string.split(" ")[0].lower()
     os.environ["APPLIO_DEVICE"] = clean_device
-    
+
     if "cpu" in clean_device:
         os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
     else:
         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-    
+
     for mod_name, mod in list(sys.modules.items()):
         if "config" in mod_name or "rvc" in mod_name:
             if hasattr(mod, "config"):
@@ -118,7 +124,9 @@ def save_parallel(parallel_bool, lock_pitch_bool):
     try:
         os.makedirs(os.path.dirname(PARALLEL_CONFIG_PATH), exist_ok=True)
         with open(PARALLEL_CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump({"parallel": parallel_bool, "lock_pitch": lock_pitch_bool}, f, indent=4)
+            json.dump(
+                {"parallel": parallel_bool, "lock_pitch": lock_pitch_bool}, f, indent=4
+            )
     except Exception as e:
         print(f"[Parallelism Selector] Error saving parallel config: {e}")
 
@@ -127,11 +135,11 @@ def apply_parallel_patch_to_backend(parallel_bool, lock_pitch_bool):
     """Updates environment variables and passes configuration flags."""
     os.environ["APPLIO_PARALLEL"] = str(parallel_bool).lower()
     os.environ["APPLIO_PARALLEL_LOCK_PITCH"] = str(lock_pitch_bool).lower()
-    
+
     os.environ.pop("OMP_NUM_THREADS", None)
     os.environ.pop("MKL_NUM_THREADS", None)
     os.environ.pop("OPENBLAS_NUM_THREADS", None)
-    
+
     for mod_name, mod in list(sys.modules.items()):
         if "config" in mod_name or "rvc" in mod_name:
             if hasattr(mod, "config"):
@@ -163,24 +171,26 @@ if RVCConfig is not None:
         if not hasattr(RVCConfig, "_is_patched_by_fork"):
             RVCConfig._is_patched_by_fork = True
             original_init = RVCConfig.__init__
-            
+
             def patched_init(self, *args, **kwargs):
                 original_init(self, *args, **kwargs)
-                
+
                 saved_device = load_saved_device()
                 if saved_device:
                     clean_dev = saved_device.split(" ")[0].lower()
                     self.device = clean_dev
                     if "cpu" in clean_dev:
                         self.is_half = False
-                        
+
                 saved_parallel, saved_lock_pitch = load_saved_parallel()
                 self.parallel = saved_parallel
                 self.parallel_lock_pitch = saved_lock_pitch
                 apply_parallel_patch_to_backend(saved_parallel, saved_lock_pitch)
-                
+
             RVCConfig.__init__ = patched_init
-            print("[Hardware & Parallelism Selector] Permanent baseline initialization hooks bound cleanly.")
+            print(
+                "[Hardware & Parallelism Selector] Permanent baseline initialization hooks bound cleanly."
+            )
     except Exception as e:
         print(f"[Hardware & Parallelism Selector] Failed to bind startup hook: {e}")
 
@@ -195,6 +205,7 @@ def get_available_devices():
         device_list.append("MPS (Apple Silicon)")
     try:
         import torch_directml
+
         if torch_directml.is_available():
             for i in range(torch_directml.device_count()):
                 device_list.append(f"DirectML:{i}")
@@ -208,7 +219,7 @@ def change_device_target(selected_device):
     cached_preference = load_saved_device()
     if cached_preference == selected_device:
         return  # Deduplicate out-of-order event loops
-        
+
     save_device(selected_device)
     apply_device_patch_to_backend(selected_device)
     print(f"[Hardware Selector] Device configuration locked to: {selected_device}")
@@ -220,10 +231,12 @@ def change_parallel_target(selected_parallel, selected_lock_pitch):
     cached_p, cached_l = load_saved_parallel()
     if cached_p == selected_parallel and cached_l == selected_lock_pitch:
         return  # Deduplicate out-of-order event loops
-        
+
     save_parallel(selected_parallel, selected_lock_pitch)
     apply_parallel_patch_to_backend(selected_parallel, selected_lock_pitch)
-    print(f"[Parallelism Selector] State updated - Parallel: {selected_parallel}, Lock Pitch: {selected_lock_pitch}")
+    print(
+        f"[Parallelism Selector] State updated - Parallel: {selected_parallel}, Lock Pitch: {selected_lock_pitch}"
+    )
     gr.Info(f"Parallelism configuration permanently synchronized!")
 
 
@@ -243,27 +256,31 @@ def settings_tab(filter_state_trigger=None):
         presence_tab()
         realtime_audio_tab()
         theme_tab()
-        
+
         # --- Permanent Parallelism Selection Section ---
         gr.Markdown("---")
         with gr.Column():
             gr.Markdown(f"### {i18n('Parallel Processing Settings')}")
-            
+
             initial_parallel, initial_lock_pitch = load_saved_parallel()
             apply_parallel_patch_to_backend(initial_parallel, initial_lock_pitch)
-            
+
             parallel_selector = gr.Checkbox(
                 value=initial_parallel,
-                label=i18n("Enable Parallel processing optimization (Multithreading / Batch parallelism)"),
-                interactive=True
+                label=i18n(
+                    "Enable Parallel processing optimization (Multithreading / Batch parallelism)"
+                ),
+                interactive=True,
             )
-            
+
             lock_pitch_selector = gr.Checkbox(
                 value=initial_lock_pitch,
-                label=i18n("Force uniform pitch calculation (Locks automated pitch matching across parallel workers)"),
-                interactive=True
+                label=i18n(
+                    "Force uniform pitch calculation (Locks automated pitch matching across parallel workers)"
+                ),
+                interactive=True,
             )
-            
+
             parallel_selector.change(
                 fn=change_parallel_target,
                 inputs=[parallel_selector, lock_pitch_selector],
@@ -275,14 +292,14 @@ def settings_tab(filter_state_trigger=None):
                 inputs=[parallel_selector, lock_pitch_selector],
                 outputs=[],
             )
-            
+
         # --- Permanent Hardware Selection Section (Moved to General Menu) ---
         gr.Markdown("---")
         with gr.Column():
             gr.Markdown(f"### {i18n('Hardware Acceleration Settings')}")
-            
+
             system_devices = get_available_devices()
-            
+
             saved_preference = load_saved_device()
             if saved_preference in system_devices:
                 initial_selection = saved_preference
@@ -290,25 +307,25 @@ def settings_tab(filter_state_trigger=None):
             else:
                 initial_selection = "CUDA:0" if torch.cuda.is_available() else "CPU"
                 apply_device_patch_to_backend(initial_selection)
-            
+
             hardware_selector = gr.Dropdown(
                 choices=system_devices,
                 value=initial_selection,
                 label=i18n("Select Processing Device (CPU / iGPU / GPU)"),
-                interactive=True
+                interactive=True,
             )
-            
+
             hardware_selector.change(
                 fn=change_device_target,
                 inputs=[hardware_selector],
                 outputs=[],
             )
         gr.Markdown("---")
-        
+
         version_tab()
         lang_tab()
         restart_tab()
-        
+
     with gr.TabItem(label=i18n("Training")):
         model_author_tab()
         precision_tab()
