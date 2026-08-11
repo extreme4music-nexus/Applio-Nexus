@@ -1,5 +1,4 @@
 @echo off
-
 if /i "%cd%"=="C:\Windows\System32" (
     color 0C
     echo Applio does not require administrator permissions and should be run as a regular user.
@@ -10,23 +9,19 @@ if /i "%cd%"=="C:\Windows\System32" (
 
 setlocal
 for %%F in ("%~dp0.") do set "folder_name=%%~nF"
-
 title %folder_name%
 
-:: Check if the virtual environment folder exists
-if not exist "%~dp0env\Scripts\activate.bat" (
-    echo [ERROR] Virtual environment 'env' not found or incomplete.
+if not exist env (
     echo Please run 'run-install.bat' first to set up the environment.
-    echo.
     pause
     exit /b 1
 )
 
-:: Activate the local virtual environment
-call "%~dp0env\Scripts\activate.bat"
+set HIP_VISIBLE_DEVICES="0"
+SET DISABLE_ADDMM_CUDA_LT=1
+set CUDA_VISIBLE_DEVICES=-1
 
-:: Launch Applio using the active environment
-python app.py --open
+:: Added CPU flag here
+env\python.exe app.py --open --device cpu
 echo.
-
 pause

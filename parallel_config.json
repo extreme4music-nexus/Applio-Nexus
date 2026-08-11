@@ -1,0 +1,16 @@
+{
+    "parallel_inference": true,
+    "split_audio": true
+}
+
+
+plex:
+  auth_method: token
+  ip: 192.168.50.23
+  port: 32400
+  ssl: false
+  token: D4LgzersXxZTdagzCzN1
+  movie_libraries:
+    - 'Movies'
+  series_libraries:
+    - 'TV Shows'

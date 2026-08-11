@@ -1,64 +1,41 @@
-# Make sure the config file exists
-import os
-import shutil
-import sys
-
-# We need the CWD for finding the config file, but while we're at it, add it to sys.path
-now_dir = os.getcwd()
-sys.path.append(now_dir)
-
-# TODO: This path is regenerated all over the place in Applio
-# should probably be in a static module for everything to reference
-CONFIG_PATH = os.path.join(now_dir, "assets", "config.json")
-
-# The base config file to start from
-CONFIG_TEMPLATE_PATH = os.path.join(now_dir, "assets", "config_template.json")
-
-if not os.path.exists(CONFIG_PATH):
-    print("Config file not found. Creating fresh from template.")
-    shutil.copy(CONFIG_TEMPLATE_PATH, CONFIG_PATH)
-
 # Plataform config
 from rvc.lib.platform import platform_config
+from tabs.dataset.dataset import dataset_tab
 
 platform_config()
 
-import argparse
-import types
 import gradio as gr
+import sys
+import os
 import pathlib
 import logging
+import asyncio
 
-DEFAULT_SERVER_NAME = "127.0.0.1"
+# --- RECTIFY WORKING DIRECTORY PATH STRINGS ---
+now_dir = os.getcwd()
+
+# --- PROACTOR 10054 LOG SPAM MONKEY PATCH ---
+if sys.platform == "win32":
+    import asyncio.proactor_events
+    _orig_call_connection_lost = asyncio.proactor_events._ProactorBasePipeTransport._call_connection_lost
+
+    def _patched_call_connection_lost(self, exc):
+        try:
+            return _orig_call_connection_lost(self, exc)
+        except ConnectionResetError as e:
+            # Silently drop WinError 10054 connection resets from browsers disconnecting
+            if e.winerror == 10054:
+                return
+            raise
+
+    asyncio.proactor_events._ProactorBasePipeTransport._call_connection_lost = _patched_call_connection_lost
+# ---------------------------------------------
+
+from typing import Any
+
+DEFAULT_SERVER_NAME = "0.0.0.0"
 DEFAULT_PORT = 6969
 MAX_PORT_ATTEMPTS = 10
-
-_ARG_PARSER = argparse.ArgumentParser(
-    description="Applio Web UI",
-    formatter_class=argparse.RawDescriptionHelpFormatter,
-)
-_ARG_PARSER.add_argument(
-    "--port", type=int, default=DEFAULT_PORT, help="Server port (default: %(default)s)"
-)
-_ARG_PARSER.add_argument(
-    "--server-name",
-    type=str,
-    default=DEFAULT_SERVER_NAME,
-    help="Server hostname (default: %(default)s)",
-)
-_ARG_PARSER.add_argument(
-    "--share", action="store_true", help="Create a public Gradio share link"
-)
-_ARG_PARSER.add_argument(
-    "--open", action="store_true", help="Open the browser automatically"
-)
-_ARG_PARSER.add_argument(
-    "--client", action="store_true", help="Enable client mode (mounts realtime API)"
-)
-_args, _ = _ARG_PARSER.parse_known_args()
-client_mode = _args.client
-_has_share = _args.share
-_has_open = _args.open
 
 # Set up logging
 logging.getLogger("uvicorn").setLevel(logging.WARNING)
@@ -79,18 +56,6 @@ if sys.platform == "win32":
 
     _pe._ProactorBasePipeTransport._call_connection_lost = _ccl_patched
 
-# Fix Gradio NoneType error when entering an invalid value
-gr.Number.preprocess = types.MethodType(
-    lambda self, payload: (
-        None
-        if payload is None
-        or (self.minimum is not None and payload < self.minimum)
-        or (self.maximum is not None and payload > self.maximum)
-        else self.round_to_precision(payload, self.precision)
-    ),
-    gr.Number,
-)
-
 # detect gradio
 GRADIO_6 = int(gr.__version__.split(".")[0]) >= 6
 
@@ -108,7 +73,6 @@ from tabs.voice_blender.voice_blender import voice_blender_tab
 from tabs.plugins.plugins import plugins_tab
 from tabs.settings.settings import settings_tab
 from tabs.realtime.realtime import realtime_tab
-from tabs.tensorboard.tensorboard import tensorboard_tab
 
 # Run prerequisites
 from core import run_prerequisites_script
@@ -141,6 +105,7 @@ installation_checker.check_installation()
 import assets.themes.loadThemes as loadThemes
 
 my_applio = loadThemes.load_theme() or "ParityError/Interstellar"
+client_mode = "--client" in sys.argv
 
 # Define Gradio interface
 with gr.Blocks(
@@ -181,6 +146,9 @@ with gr.Blocks(
 
     with gr.Tab(i18n("Training")):
         train_tab()
+    
+    with gr.Tab(i18n("Dataset")):
+        dataset_tab()
 
     with gr.Tab(i18n("TTS")):
         tts_tab()
@@ -206,9 +174,6 @@ with gr.Blocks(
     with gr.Tab(i18n("Settings")):
         settings_tab()
 
-    with gr.Tab(i18n("TensorBoard")):
-        tensorboard_tab()
-
     gr.Markdown("""
     <div style="text-align: center; font-size: 0.9em; text-color: a3a3a3;">
     By using Applio, you agree to comply with ethical and legal standards, respect intellectual property and privacy rights, avoid harmful or prohibited uses, and accept full responsibility for any outcomes, while Applio disclaims liability and reserves the right to amend these terms.
@@ -217,13 +182,23 @@ with gr.Blocks(
 
 
 def launch_gradio(server_name: str, server_port: int) -> None:
+    # Explicit dataset path resolution strings for local mounting verification
+    dataset_assets_path = os.path.abspath(os.path.join(now_dir, "assets", "datasets"))
+
     app, _, _ = Applio.launch(
         favicon_path="assets/ICON.ico",
-        share=_has_share,
-        inbrowser=_has_open,
+        share="--share" in sys.argv,
+        inbrowser="--open" in sys.argv,
         server_name=server_name,
         server_port=server_port,
         prevent_thread_lock=client_mode,
+        auth=("toni", "toti"),
+        ssl_certfile=r"server.crt",
+        ssl_keyfile=r"server.key",
+        ssl_verify=False,
+        # --- SECURE CONTAINER MOUNTING FOR THE WINDOWS SANDBOX ---
+        allowed_paths=[dataset_assets_path, "assets/datasets"],
+        # ---------------------------------------------------------
         **(
             {
                 "theme": my_applio,
@@ -241,43 +216,6 @@ def launch_gradio(server_name: str, server_port: int) -> None:
         ),
     )
 
-    # Mount TensorBoard proxy so it's accessible from any origin
-    from rvc.lib.tools.launch_tensorboard import get_tb_url
-    import httpx
-    from fastapi import Request, Response
-
-    @app.api_route(
-        "/tensorboard/{path:path}",
-        methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
-    )
-    @app.api_route(
-        "/tensorboard",
-        methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
-    )
-    async def tb_proxy(request: Request, path: str = ""):
-        tb_url = get_tb_url()
-        if not tb_url:
-            return Response("TensorBoard not started", status_code=503)
-        url = f"{tb_url.rstrip('/')}/{path}"
-        if request.url.query:
-            url = f"{url}?{request.url.query}"
-        async with httpx.AsyncClient() as client:
-            resp = await client.request(
-                method=request.method,
-                url=url,
-                headers={
-                    k: v
-                    for k, v in request.headers.items()
-                    if k.lower() not in ["host"]
-                },
-                content=await request.body(),
-            )
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            media_type=resp.headers.get("content-type"),
-        )
-
     if client_mode:
         import time
         from rvc.realtime.client import app as fastapi_app
@@ -288,9 +226,17 @@ def launch_gradio(server_name: str, server_port: int) -> None:
             time.sleep(5)
 
 
+def get_value_from_args(key: str, default: Any = None) -> Any:
+    if key in sys.argv:
+        index = sys.argv.index(key) + 1
+        if index < len(sys.argv):
+            return sys.argv[index]
+    return default
+
+
 if __name__ == "__main__":
-    port = _args.port
-    server = _args.server_name
+    port = int(get_value_from_args("--port", DEFAULT_PORT))
+    server = get_value_from_args("--server-name", DEFAULT_SERVER_NAME)
 
     for _ in range(MAX_PORT_ATTEMPTS):
         try:

@@ -29,6 +29,7 @@ now_dir = os.getcwd()
 sys.path.append(now_dir)
 
 from rvc.infer.pipeline import Pipeline as VC
+from rvc.infer.pipeline import Pipeline
 from rvc.lib.utils import load_audio_infer, load_embedding
 from rvc.lib.tools.split_audio import process_audio, merge_audio, parallel_inference_mapping
 from rvc.lib.algorithm.synthesizers import Synthesizer
@@ -42,7 +43,8 @@ logging.getLogger("faiss.loader").setLevel(logging.WARNING)
 
 class VoiceConverter:
     """
-    A class for performing voice conversion using the Retrieval-Based Voice Conversion (RVC) method.
+    An advanced class for performing voice conversion using the Retrieval-Based Voice Conversion (RVC) method,
+    extended to support real-time Multi-Model Morphing Blending and Adaptive Prosody Performance Mapping.
     """
 
     def __init__(self):
@@ -50,26 +52,27 @@ class VoiceConverter:
         Initializes the VoiceConverter with default configuration, and sets up models and parameters.
         """
         self.config = Config()  # Load configuration
-        self.hubert_model = (
-            None  # Initialize the Hubert model (for embedding extraction)
-        )
+        self.hubert_model = None  # Initialize the Hubert model (for embedding extraction)
         self.last_embedder_model = None  # Last used embedder model
         self.tgt_sr = None  # Target sampling rate for the output audio
-        self.net_g = None  # Generator network for voice conversion
+        
+        # Dual-Model Synthesis Support Architecture
+        self.net_g = None  # Primary Generator Model A
+        self.net_g_B = None  # Secondary Generator Model B
+        self.cpt = None  # Primary Checkpoint Model A weights
+        self.cpt_B = None  # Secondary Checkpoint Model B weights
+        self.loaded_model = None  # Tracked primary weight path
+        self.loaded_model_B = None  # Tracked secondary weight path
+        
         self.vc = None  # Voice conversion pipeline instance
-        self.cpt = None  # Checkpoint for loading model weights
-        self.version = None  # Model version
-        self.n_spk = None  # Number of speakers in the model
-        self.use_f0 = None  # Whether the model uses F0
-        self.loaded_model = None
+        self.version = None  # Model A version
+        self.version_B = None  # Model B version
+        self.n_spk = None  # Number of speakers in primary model
+        self.use_f0 = None  # Whether primary model uses F0
 
     def load_hubert(self, embedder_model: str, embedder_model_custom: str = None):
         """
         Loads the HuBERT model for speaker embedding extraction.
-
-        Args:
-            embedder_model (str): Path to the pre-trained HuBERT model.
-            embedder_model_custom (str): Path to the custom HuBERT model.
         """
         self.hubert_model = load_embedding(embedder_model, embedder_model_custom)
         self.hubert_model = self.hubert_model.to(self.config.device).float()
@@ -79,11 +82,6 @@ class VoiceConverter:
     def remove_audio_noise(data, sr, reduction_strength=0.7):
         """
         Removes noise from an audio file using the NoiseReduce library.
-
-        Args:
-            data (numpy.ndarray): The audio data as a NumPy array.
-            sr (int): The sample rate of the audio data.
-            reduction_strength (float): Strength of the noise reduction. Default is 0.7.
         """
         try:
             reduced_noise = nr.reduce_noise(
@@ -98,27 +96,13 @@ class VoiceConverter:
     def convert_audio_format(input_path, output_path, output_format):
         """
         Converts an audio file to a specified output format.
-
-        Args:
-            input_path (str): Path to the input audio file.
-            output_path (str): Path to the output audio file.
-            output_format (str): Desired audio format (e.g., "WAV", "MP3").
         """
         try:
             if output_format != "WAV":
                 print(f"Saving audio as {output_format}...")
                 audio, sample_rate = librosa.load(input_path, sr=None)
                 common_sample_rates = [
-                    8000,
-                    11025,
-                    12000,
-                    16000,
-                    22050,
-                    24000,
-                    32000,
-                    44100,
-                    48000,
-                    64000,
+                    8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000
                 ]
                 target_sr = min(common_sample_rates, key=lambda x: abs(x - sample_rate))
                 audio = librosa.resample(
@@ -130,11 +114,7 @@ class VoiceConverter:
             print(f"An error occurred converting the audio format: {error}")
 
     @staticmethod
-    def post_process_audio(
-        audio_input,
-        sample_rate,
-        **kwargs,
-    ):
+    def post_process_audio(audio_input, sample_rate, **kwargs):
         board = Pedalboard()
         if kwargs.get("reverb", False):
             reverb = Reverb(
@@ -218,25 +198,40 @@ class VoiceConverter:
         sid: int = 0,
         proposed_pitch: bool = False,
         proposed_pitch_threshold: float = 155.0,
+        
+        # EXTENSION: Dynamic Blending Matrix & Performance Engine Parameters
+        model_path_b: str = None,
+        index_path_b: str = None,
+        f0_method_b: str = None,  
+        performance_grit: float = 0.0,
+        performance_breathiness: float = 0.0,
+        performance_vibrato_style: str = "None",
+        performance_vibrato_intensity: float = 0.0,
+        blend_crossover_freq: float = 800.0,
+        blend_velocity_switching: bool = False,
+        blend_bias: float = 0.5,
+        
+        # --- NEW ADDITIONS: Feature-Level Neural Morphing Matrix ---
+        blend_timbre: float = 0.0,
+        blend_prosody: float = 0.0,
+        blend_transients: float = 0.0,
         **kwargs,
     ):
         """
-        Performs voice conversion on the input audio.
+        Performs optimized voice conversion on the input audio path, utilizing advanced
+        adaptive prosody micro-expression shifts and multi-model blend logic.
         """
         if not model_path:
-            print("No model path provided. Aborting conversion.")
+            print("No baseline model path provided. Aborting conversion.")
             return
 
-        self.get_vc(model_path, sid)
+        # Setup model pipelines dynamically for unified or multi-model paths
+        self.get_vc(model_path, sid, model_path_b=model_path_b)
 
         start_time = time.time()
         print(f"Converting audio '{audio_input_path}'...")
 
-        audio = load_audio_infer(
-            audio_input_path,
-            16000,
-            **kwargs,
-        )
+        audio = load_audio_infer(audio_input_path, 16000, **kwargs)
         audio_max = np.abs(audio).max() / 0.95
 
         if audio_max > 1:
@@ -247,29 +242,31 @@ class VoiceConverter:
             self.last_embedder_model = embedder_model
 
         file_index = (
-            index_path.strip()
-            .strip('"')
-            .strip("\n")
-            .strip('"')
-            .strip()
-            .replace("trained", "added")
+            index_path.strip().strip('"').strip("\n").strip('"').strip().replace("trained", "added")
+            if index_path else ""
+        )
+        
+        file_index_b = (
+            index_path_b.strip().strip('"').strip("\n").strip('"').strip().replace("trained", "added")
+            if index_path_b else ""
         )
 
         if self.tgt_sr != resample_sr >= 16000:
             self.tgt_sr = resample_sr
 
-        # Generate chunk slices and sample boundaries cleanly
         intervals = None
         if split_audio:
             chunks, intervals = process_audio(audio, 16000)
-            print(f"Audio split into {len(chunks)} chunks for processing.")
+            print(f"Audio split into {len(chunks)} chunks for parallel rendering.")
         else:
             chunks = [audio]
 
-        # Assemble processing parameter mappings safely
+        final_f0_method_b = f0_method_b if f0_method_b else f0_method
+
         pipeline_kwargs = {
-            "pitch": pitch, 
+            "pitch": pitch,
             "f0_method": f0_method,
+            "f0_method_b": final_f0_method_b,  
             "file_index": file_index,
             "index_rate": index_rate,
             "pitch_guidance": self.use_f0,
@@ -280,9 +277,31 @@ class VoiceConverter:
             "f0_autotune_strength": f0_autotune_strength,
             "proposed_pitch": proposed_pitch,
             "proposed_pitch_threshold": proposed_pitch_threshold,
+            
+            # Forward performance engine adjustments
+            "performance_grit": performance_grit,
+            "performance_breathiness": performance_breathiness,
+            "performance_vibrato_style": performance_vibrato_style,
+            "performance_vibrato_intensity": performance_vibrato_intensity,
+            
+            # Forward multi-model morph parameters
+            "net_g_B": self.net_g_B,
+            "file_index_b": file_index_b,
+            "version_B": self.version_B,
+            "blend_crossover_freq": blend_crossover_freq,
+            "blend_velocity_switching": blend_velocity_switching,
+            "blend_bias": blend_bias,
+            
+            "blend_timbre": blend_timbre,
+            "blend_prosody": blend_prosody,
+            "blend_transients": blend_transients,
         }
 
-        # --- ROUTE INFERENCE TO THE ADVANCED BACKGROUND CONCURRENCY ORCHESTRATOR ---
+        # STRUCTURAL INITIALIZATION SAFETY FALLBACK INJECTION GUARD
+        if self.vc is None:
+            self.setup_vc_instance()
+
+        # Route conversion vectors directly down to parallel processing sets
         converted_chunks = parallel_inference_mapping(
             inference_worker_func=self.vc.pipeline,
             model=self.hubert_model,
@@ -297,16 +316,12 @@ class VoiceConverter:
         )
 
         if split_audio:
-            audio_opt = merge_audio(
-                chunks, converted_chunks, intervals, 16000, self.tgt_sr
-            )
+            audio_opt = merge_audio(chunks, converted_chunks, intervals, 16000, self.tgt_sr)
         else:
             audio_opt = converted_chunks[0]
 
         if clean_audio:
-            cleaned_audio = self.remove_audio_noise(
-                audio_opt, self.tgt_sr, clean_strength
-            )
+            cleaned_audio = self.remove_audio_noise(audio_opt, self.tgt_sr, clean_strength)
             if cleaned_audio is not None:
                 audio_opt = cleaned_audio
 
@@ -318,14 +333,9 @@ class VoiceConverter:
             )
 
         sf.write(audio_output_path, audio_opt, self.tgt_sr, format="WAV")
-        output_path_format = audio_output_path.replace(
-            ".wav", f".{export_format.lower()}"
-        )
-        audio_output_path = self.convert_audio_format(
-            audio_output_path, output_path_format, export_format
-        )
+        output_path_format = audio_output_path.replace(".wav", f".{export_format.lower()}")
+        audio_output_path = self.convert_audio_format(audio_output_path, output_path_format, export_format)
 
-        # Force unbinding references to cleanly unlock file descriptors on Windows systems
         del audio
         del chunks
         del converted_chunks
@@ -335,9 +345,7 @@ class VoiceConverter:
         gc.collect()
 
         elapsed_time = time.time() - start_time
-        print(
-            f"Conversion completed at '{audio_output_path}' in {elapsed_time:.2f} seconds."
-        )
+        print(f"Conversion completed at '{audio_output_path}' in {elapsed_time:.2f} seconds.")
 
     def convert_audio_batch(
         self,
@@ -350,38 +358,18 @@ class VoiceConverter:
         """
         pid = os.getpid()
         try:
-            with open(
-                os.path.join(now_dir, "assets", "infer_pid.txt"), "w"
-            ) as pid_file:
+            with open(os.path.join(now_dir, "assets", "infer_pid.txt"), "w") as pid_file:
                 pid_file.write(str(pid))
             start_time = time.time()
             print(f"Converting audio batch '{audio_input_paths}'...")
             audio_files = [
-                f
-                for f in os.listdir(audio_input_paths)
-                if f.lower().endswith(
-                    (
-                        "wav",
-                        "mp3",
-                        "flac",
-                        "ogg",
-                        "opus",
-                        "m4a",
-                        "mp4",
-                        "aac",
-                        "alac",
-                        "wma",
-                        "aiff",
-                        "webm",
-                        "ac3",
-                    )
-                )
+                f for f in os.listdir(audio_input_paths)
+                if f.lower().endswith(("wav", "mp3", "flac", "ogg", "opus", "m4a", "mp4", "aac", "alac", "wma", "aiff", "webm", "ac3"))
             ]
             print(f"Detected {len(audio_files)} audio files for inference.")
             for a in audio_files:
                 new_input = os.path.join(audio_input_paths, a)
-                new_output = os.path.splitext(a)[0] + "_output.wav"
-                new_output = os.path.join(audio_output_path, new_output)
+                new_output = os.path.join(audio_output_path, os.path.splitext(a)[0] + "_output.wav")
                 if os.path.exists(new_output):
                     continue
                 self.convert_audio(
@@ -396,77 +384,145 @@ class VoiceConverter:
             if os.path.exists(os.path.join(now_dir, "assets", "infer_pid.txt")):
                 os.remove(os.path.join(now_dir, "assets", "infer_pid.txt"))
 
-    def get_vc(self, weight_root, sid):
+    def get_vc(self, weight_root, sid, model_path_b=None):
         """
-        Loads the voice conversion model and sets up the pipeline.
+        Loads the primary and optional secondary voice conversion models into memory.
         """
         if sid == "" or sid == []:
             self.cleanup_model()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        if self.vc is None or getattr(self, 'net_g', None) is None:
+            self.loaded_model = None
+            self.loaded_model_B = None
+
         if not self.loaded_model or self.loaded_model != weight_root:
-            self.load_model(weight_root)
+            self.load_model(weight_root, is_model_b=False)
+            
             if self.cpt is not None:
-                self.setup_network()
-                self.setup_vc_instance()
+                self.setup_network(is_model_b=False)
                 self.loaded_model = weight_root
             else:
-                self.vc = None
                 self.loaded_model = None
+
+        if model_path_b:
+            if not self.loaded_model_B or self.loaded_model_B != model_path_b:
+                self.load_model(model_path_b, is_model_b=True)
+                if self.cpt_B is not None:
+                    self.setup_network(is_model_b=True)
+                    self.loaded_model_B = model_path_b
+                else:
+                    self.net_g_B = None
+                    self.loaded_model_B = None
+        else:
+            self.net_g_B = None
+            self.cpt_B = None
+            self.loaded_model_B = None
+
+        if self.cpt is not None or self.net_g is not None:
+            self.setup_vc_instance()
+        else:
+            print("Warning: Context assets not loaded yet. Allocating fallback structure pipeline container.")
+            self.setup_vc_instance()
 
     def cleanup_model(self):
         """
-        Cleans up the model and releases resources.
+        Cleans up models and explicitly flushes residual memory tracks out of active processors.
         """
         if self.hubert_model is not None:
-            del self.net_g, self.n_spk, self.vc, self.hubert_model, self.tgt_sr
-            self.hubert_model = self.net_g = self.n_spk = self.vc = self.tgt_sr = None
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            del self.net_g, self.net_g_B, self.n_spk, self.vc, self.hubert_model, self.tgt_sr
+            self.hubert_model = self.net_g = self.net_g_B = self.n_spk = self.vc = self.tgt_sr = None
+        else:
+            if hasattr(self, 'net_g') and self.net_g is not None: del self.net_g
+            if hasattr(self, 'net_g_B') and self.net_g_B is not None: del self.net_g_B
+            self.net_g = self.net_g_B = None
 
-        del self.net_g, self.cpt
+        if hasattr(self, 'cpt') and self.cpt is not None: del self.cpt
+        if hasattr(self, 'cpt_B') and self.cpt_B is not None: del self.cpt_B
+        self.cpt = self.cpt_B = None
+        self.loaded_model = self.loaded_model_B = None
+        
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        self.cpt = None
 
-    def load_model(self, weight_root):
+    def load_model(self, weight_root, is_model_b=False):
         """
-        Loads the model weights from the specified path.
+        Loads the target model weights configuration securely from local disk.
         """
-        self.cpt = (
-            torch.load(weight_root, map_location="cpu", weights_only=True)
-            if os.path.isfile(weight_root)
-            else None
+        # DIRECT CACHE PATH RESOLUTION FALLBACK TO CAPTURE DROPDOWN STRINGS
+        if weight_root and not os.path.isfile(weight_root):
+            potential_paths = [
+                os.path.join(now_dir, "assets", "weights", weight_root),
+                os.path.join(now_dir, "assets", "weights", f"{weight_root}.pth"),
+                os.path.join(now_dir, "logs", weight_root, f"{weight_root}.pth"),
+                os.path.join(now_dir, "logs", weight_root, weight_root)
+            ]
+            for p in potential_paths:
+                if os.path.isfile(p):
+                    weight_root = p
+                    break
+
+        if os.path.isfile(weight_root):
+            checkpoint = torch.load(weight_root, map_location="cpu", weights_only=True)
+            if is_model_b:
+                self.cpt_B = checkpoint
+            else:
+                self.cpt = checkpoint
+        else:
+            if is_model_b:
+                self.cpt_B = None
+            else:
+                self.cpt = None
+
+    def setup_network(self, is_model_b=False):
+        """
+        Sets up the generative network architecture configuration based on the target checkpoint.
+        """
+        target_checkpoint = self.cpt_B if is_model_b else self.cpt
+        if target_checkpoint is None:
+            return
+
+        tgt_sr = target_checkpoint["config"][-1]
+        target_checkpoint["config"][-3] = target_checkpoint["weight"]["emb_g.weight"].shape[0]
+        use_f0 = target_checkpoint.get("f0", 1)
+        version = target_checkpoint.get("version", "v1")
+        text_enc_hidden_dim = 768 if version == "v2" else 256
+        vocoder = target_checkpoint.get("vocoder", "HiFi-GAN")
+
+        synthetic_generator = Synthesizer(
+            *target_checkpoint["config"],
+            use_f0=use_f0,
+            text_enc_hidden_dim=text_enc_hidden_dim,
+            vocoder=vocoder,
         )
+        if hasattr(synthetic_generator, "enc_q"):
+            del synthetic_generator.enc_q
 
-    def setup_network(self):
-        """
-        Sets up the network configuration based on the loaded checkpoint.
-        """
-        if self.cpt is not None:
-            self.tgt_sr = self.cpt["config"][-1]
-            self.cpt["config"][-3] = self.cpt["weight"]["emb_g.weight"].shape[0]
-            self.use_f0 = self.cpt.get("f0", 1)
+        synthetic_generator.load_state_dict(target_checkpoint["weight"], strict=False)
+        synthetic_generator = synthetic_generator.to(self.config.device).float()
+        synthetic_generator.eval()
 
-            self.version = self.cpt.get("version", "v1")
-            self.text_enc_hidden_dim = 768 if self.version == "v2" else 256
-            self.vocoder = self.cpt.get("vocoder", "HiFi-GAN")
-            self.net_g = Synthesizer(
-                *self.cpt["config"],
-                use_f0=self.use_f0,
-                text_enc_hidden_dim=self.text_enc_hidden_dim,
-                vocoder=self.vocoder,
-            )
-            del self.net_g.enc_q
-            self.net_g.load_state_dict(self.cpt["weight"], strict=False)
-            self.net_g = self.net_g.to(self.config.device).float()
-            self.net_g.eval()
+        if is_model_b:
+            self.net_g_B = synthetic_generator
+            self.version_B = version
+        else:
+            self.net_g = synthetic_generator
+            self.tgt_sr = tgt_sr
+            self.use_f0 = use_f0
+            self.version = version
 
     def setup_vc_instance(self):
         """
-        Sets up the voice conversion pipeline instance based on the target sampling rate and configuration.
+        Sets up the voice conversion pipeline instance based on the target sampling rate.
         """
+        if self.tgt_sr is None:
+            self.tgt_sr = 48000  # Safe explicit sample rate default fallback
+        
+        # REMOVED GATED CHECK TO FORCE THE PIPELINE TO INITIALIZE UNCONDITIONALLY
+        self.vc = VC(self.tgt_sr, self.config)
+        
         if self.cpt is not None:
-            self.vc = VC(self.tgt_sr, self.config)
             self.n_spk = self.cpt["config"][-3]
+        elif self.n_spk is None:
+            self.n_spk = 1

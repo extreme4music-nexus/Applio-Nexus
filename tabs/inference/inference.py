@@ -4,11 +4,14 @@ import os
 import shutil
 import sys
 import traceback
-
+import concurrent.futures
 import gradio as gr
 import regex as re
 import torch
-
+import librosa
+import numpy as np
+from scipy import signal
+import soundfile as sf
 from assets.i18n.i18n import I18nAuto
 from core import run_batch_infer_script, run_infer_script
 from rvc.lib.utils import format_title
@@ -56,7 +59,6 @@ def normalize_path(p):
     return os.path.normpath(p).replace("\\", "/").lower()
 
 
-# BASE model/index folder names for many latin languages (legacy: zips = models)
 MODEL_FOLDER = re.compile(r"^(?:model.{0,4}|mdl(?:s)?|weight.{0,4}|zip(?:s)?)$")
 INDEX_FOLDER = re.compile(r"^(?:ind.{0,4}|idx(?:s)?)$")
 
@@ -70,12 +72,6 @@ def is_idx_alias(name: str) -> bool:
 
 
 def alias_score(path: str, want_model: bool) -> int:
-    """
-    Handles duplicate files, compare file type to path and assign a score:
-    2 = Path contains correct alias  (e.g., model file in 'modelos/' folder)
-    1 = Path contains opposite alias (e.g., model file in 'index/' folder)
-    0 = Path contains no recognized aliases
-    """
     parts = normalize_path(os.path.dirname(path)).split("/")
     has_mdl = any(is_mdl_alias(p) for p in parts)
     has_idx = any(is_idx_alias(p) for p in parts)
@@ -109,9 +105,7 @@ def get_files(type="model"):
             score = alias_score(full, is_model)
 
             prev = best.get(real)
-            if (
-                prev is None
-            ):  # Prefer higher score; if equal score, use first encountered
+            if prev is None:
                 best[real] = (score, order, full)
             else:
                 prev_score, prev_order, _ = prev
@@ -215,9 +209,7 @@ def refresh_presets():
 
 
 def output_path_fn(input_audio_path):
-    original_name_without_extension = os.path.basename(input_audio_path).rsplit(".", 1)[
-        0
-    ]
+    original_name_without_extension = os.path.basename(input_audio_path).rsplit(".", 1)[0]
     new_name = original_name_without_extension + "_output.wav"
     output_path = os.path.join(os.path.dirname(input_audio_path), new_name)
     return output_path
@@ -241,26 +233,16 @@ def change_choices(model):
         and "_output" not in name
     ]
 
+    spk_choices = sorted(speakers) if speakers and isinstance(speakers, (list, tuple)) else [0]
+
     return (
         {"choices": models_list, "__type__": "update"},
         {"choices": indexes_list, "__type__": "update"},
         {"choices": sorted(audio_paths), "__type__": "update"},
-        {
-            "choices": (
-                sorted(speakers)
-                if speakers is not None and isinstance(speakers, (list, tuple))
-                else [0]
-            ),
-            "__type__": "update",
-        },
-        {
-            "choices": (
-                sorted(speakers)
-                if speakers is not None and isinstance(speakers, (list, tuple))
-                else [0]
-            ),
-            "__type__": "update",
-        },
+        {"choices": spk_choices, "__type__": "update"},
+        {"choices": spk_choices, "__type__": "update"},
+        {"choices": models_list, "__type__": "update"},
+        {"choices": indexes_list, "__type__": "update"},
     )
 
 
@@ -305,16 +287,7 @@ def delete_outputs():
                 os.remove(os.path.join(root, name))
 
 
-def folders_same(
-    a: str, b: str
-) -> bool:  # Used to "pair" index and model folders based on path names
-    """
-    True if:
-      1) The two normalized paths are totally identical..OR
-      2) One lives under a MODEL_FOLDER and the other lives
-         under an INDEX_FOLDER, at the same relative subpath
-         i.e.  logs/models/miku  and  logs/index/miku  =  "SAME FOLDER"
-    """
+def folders_same(a: str, b: str) -> bool:
     a = normalize_path(a)
     b = normalize_path(b)
     if a == b:
@@ -347,7 +320,6 @@ def match_index(model_file_value):
     if not model_file_value:
         return ""
 
-    # Derive the information about the model's name and path for index matching
     model_folder = normalize_path(os.path.dirname(model_file_value))
     model_name = os.path.basename(model_file_value)
     base_name = os.path.splitext(model_name)[0]
@@ -374,38 +346,27 @@ def match_index(model_file_value):
             same_count += 1
             last_same = idx
 
-            # 1) EXACT match to loaded model name and folders_same = True
             if idx_base == base_name:
                 return idx
 
-            # 2) Substring match to model name and folders_same
-            if common in idx_base and same_substr is None:
+            if same_substr is None and common in idx_base:
                 same_substr = idx
 
-            # 3) Prefix match to model name and folders_same
             if prefix and idx_base.startswith(prefix) and same_prefixed is None:
                 same_prefixed = idx
-
-        # If it's NOT in a paired folder (folders_same = False) we look elseware:
         else:
-            # 4) EXACT match to model name in external directory
             if idx_base == base_name and external_exact is None:
-                external_exact = idx
+                return idx
 
-            # 5) Substring match to model name in ED
             if common in idx_base and external_substr is None:
                 external_substr = idx
 
-            # 6) Prefix match to model name in ED
             if prefix and idx_base.startswith(prefix) and external_pref is None:
                 external_pref = idx
 
-    # Fallback: If there is exactly one index file in the same (or paired) folder,
-    # we should assume that's the intended index file even if the name doesnt match
     if same_count == 1:
         return last_same
 
-    # Then by remaining priority queue:
     if same_substr:
         return same_substr
     if same_prefixed:
@@ -448,7 +409,7 @@ def create_folder_and_move_files(folder_name, bin_file, config_file):
 
 
 def refresh_formant():
-    json_files = list_json_files(FORMANTSHIFT_DIR)
+    json_files = list_json_files(PRESETS_DIR)
     return gr.update(choices=json_files)
 
 
@@ -496,9 +457,15 @@ def update_filter_visibility(_):
     return gr.update(visible=True), gr.skip(), gr.skip()
 
 
-# Inference tab
 def inference_tab():
     trigger = get_filter_trigger()
+    
+    # Pre-declare variables to allocate memory references before layout attachments occur
+    #global model_file_b, index_file_b
+    # Initialize as dummy hidden layout components so Gradio registers valid component IDs instantly
+    model_file_b = gr.Dropdown(visible=False)
+    index_file_b = gr.Dropdown(visible=False)
+
     with gr.Column():
         with gr.Row():
             model_file = gr.Dropdown(
@@ -544,9 +511,11 @@ def inference_tab():
                 fn=lambda: (
                     {"value": "", "__type__": "update"},
                     {"value": "", "__type__": "update"},
+                    {"value": "", "__type__": "update"},
+                    {"value": "", "__type__": "update"},
                 ),
                 inputs=[],
-                outputs=[model_file, index_file],
+                outputs=[model_file, index_file, model_file_b, index_file_b],
             )
             model_file.select(
                 fn=lambda model_file_value: match_index(model_file_value),
@@ -554,7 +523,6 @@ def inference_tab():
                 outputs=[index_file],
             )
 
-    # Single inference tab
     with gr.Tab(i18n("Single")):
         with gr.Column():
             upload_audio = gr.Audio(
@@ -1031,8 +999,8 @@ def inference_tab():
                     )
                     import_file.change(
                         import_presets_button,
-                        inputs=import_file,
-                        outputs=[preset_dropdown],
+                        import_file,
+                        [preset_dropdown],
                     )
                     presets_refresh_button.click(
                         refresh_presets, outputs=preset_dropdown
@@ -1086,8 +1054,8 @@ def inference_tab():
                 )
                 preset_dropdown.change(
                     update_sliders,
-                    inputs=preset_dropdown,
-                    outputs=[
+                    preset_dropdown,
+                    [
                         pitch,
                         index_rate,
                         rms_mix_rate,
@@ -1096,7 +1064,7 @@ def inference_tab():
                 )
                 export_button.click(
                     export_presets_button,
-                    inputs=[
+                    [
                         preset_name_input,
                         pitch,
                         index_rate,
@@ -1104,23 +1072,21 @@ def inference_tab():
                         protect,
                     ],
                 )
+            with gr.Row():
                 f0_method = gr.Radio(
                     label=i18n("Pitch extraction algorithm"),
-                    info=i18n(
-                        "Pitch extraction algorithm to use for the audio conversion. The default algorithm is rmvpe, which is recommended for most cases."
-                    ),
-                    choices=[
-                        "crepe",
-                        "crepe-tiny",
-                        "rmvpe",
-                        "fcpe",
-                    ],
+                    choices=["pm", "harvest", "crepe", "rmvpe", "fcpe"],
                     value="rmvpe",
                     interactive=True,
                 )
+                f0_file = gr.File(
+                    label=i18n("External F0 Curve File (Optional)"),
+                    type="filepath",
+                    interactive=True,
+                    visible=True,
+                )
                 embedder_model = gr.Radio(
                     label=i18n("Embedder Model"),
-                    info=i18n("Model used for learning speaker embedding."),
                     choices=[
                         "contentvec",
                         "spin",
@@ -1132,7 +1098,7 @@ def inference_tab():
                     ],
                     value="contentvec",
                     interactive=True,
-                )
+                )    
                 with gr.Column(visible=False) as embedder_custom:
                     with gr.Accordion(i18n("Custom Embedder"), open=True):
                         with gr.Row():
@@ -1163,20 +1129,219 @@ def inference_tab():
                             i18n("Move files to custom embedder folder")
                         )
 
+            with gr.Accordion(i18n("Nexus Performance & Multi-Model Blending Matrix"), open=False):
+                gr.Markdown(f"### 🚀 {i18n('Performance Expression Engine')}")
+                with gr.Row():
+                    performance_grit = gr.Slider(
+                        minimum=0.0,
+                        maximum=1.0,
+                        step=0.01,
+                        value=0.0,
+                        label=i18n("Dialogue Grit / Aggression Intensity"),
+                        info=i18n("Injects gravelly fold characteristics, perfect for simulating elevated emotion or anger.")
+                    )
+                    performance_breathiness = gr.Slider(
+                        minimum=0.0,
+                        maximum=1.0,
+                        step=0.01,
+                        value=0.0,
+                        label=i18n("Dialogue Breathiness / Secretive Whisper"),
+                        info=i18n("Introduces high-frequency noise elements to give conversation an intimate, fatigued, or whispered feel.")
+                    )
+                with gr.Row():
+                    performance_vibrato_style = gr.Dropdown(
+                        choices=["None", "Pop", "Jazz", "Opera"],
+                        value="None",
+                        label=i18n("Conversational Vibrato CAD Emulation"),
+                        info=i18n("Applies micro-expression fluctuations onto steady spoken notes.")
+                    )   
+                    performance_vibrato_intensity = gr.Slider(
+                        minimum=0.0,
+                        maximum=1.0,
+                        step=0.01,
+                        value=0.0,
+                        label=i18n("Vibrato Dialogue Modulation Depth"),
+                        info=i18n("Adjusts the resonance limits of the underlying tracking vocal path oscillators.")
+                    )
+        
+                gr.Markdown(f"### 🧬 {i18n('Feature-Level Neural Morph Matrix')}")
+                with gr.Row():
+                    model_file_b = gr.Dropdown(
+                        label=i18n("Voice Model B (Secondary Genetic Checkpoint)"),
+                        info=i18n("Select the secondary voice checkpoint to extract target hidden vectors from simultaneously."),
+                        choices=sorted(get_files("model"), key=extract_model_and_epoch),
+                        value="",
+                        interactive=True,
+                        allow_custom_value=True,
+                    )
+                    index_file_b = gr.Dropdown(
+                        label=i18n("Index File B (Secondary Feature Database)"),
+                        info=i18n("Select the secondary index file to perform parallel hidden-state Faiss k-NN cluster queries."),
+                        choices=sorted(get_files("index")),
+                        value="",
+                        interactive=True,
+                        allow_custom_value=True,
+                    )
+                with gr.Row():
+                    embedder_model_b = gr.Radio(
+                        label=i18n("Embedder Model B"),
+                        choices=["contentvec", "spin", "spin-v2", "chinese-hubert-base", "japanese-hubert-base", "korean-hubert-base", "custom"],
+                        value="contentvec",
+                    interactive=True
+                    )
+                with gr.Column(visible=False) as embedder_custom_b:
+                    with gr.Accordion(i18n("Custom Embedder"), open=True):
+                        with gr.Row():
+                            embedder_model_custom_b = gr.Dropdown(
+                                label=i18n("Select Custom Embedder"),
+                                choices=refresh_embedders_folders(),
+                                interactive=True,
+                                allow_custom_value=True,
+                            )
+                            refresh_embedders_button_b = gr.Button(
+                                i18n("Refresh embedders")
+                            )
+                        folder_name_input_b = gr.Textbox(
+                            label=i18n("Folder Name"), interactive=True
+                        )
+                        with gr.Row():
+                            bin_file_upload_b = gr.File(
+                                label=i18n("Upload .bin"),
+                                type="filepath",
+                                interactive=True,
+                            )
+                            config_file_upload_b = gr.File(
+                                label=i18n("Upload .json"),
+                                type="filepath",
+                                interactive=True,
+                            )
+                        move_files_button_b = gr.Button(
+                            i18n("Move files to custom embedder folder")
+                        )
+                    f0_method_b = gr.Radio(
+                        label=i18n("Pitch extraction algorithm B"),
+                        info=i18n("Pitch algorithm used to calculate the standalone F0 reference curve for Model B."),
+                        choices=["crepe", "crepe-tiny", "rmvpe", "fcpe"],
+                        value="rmvpe",
+                        interactive=True,
+                    )
+
+                with gr.Row():
+                    blend_timbre = gr.Slider(
+                        minimum=0.0,
+                        maximum=1.0,
+                        step=0.01,
+                        value=0.5,
+                        label=i18n("Vocal Color & Harmonic Tone Blend"),
+                        info=i18n("0.0 isolates Model A hidden states completely; 1.0 shifts neural color and format tracking entirely to Model B.")
+                    )
+                    blend_prosody = gr.Slider(
+                        minimum=0.0,
+                        maximum=1.0,
+                        step=0.01,
+                        value=0.5,
+                        label=i18n("Pitch Prosody & Intonation Dominance"),
+                        info=i18n("Determines which character's melodic boundaries and accentuation fluctuations dictate note transitions.")
+                    )
+                with gr.Row():
+                    blend_transients = gr.Slider(
+                        minimum=0.0,
+                        maximum=1.0,
+                        step=0.01,
+                        value=0.5,
+                        label=i18n("Consonant Articulation Sharpness"),
+                        info=i18n("Controls whether unvoiced speech elements (S, T, P, K) match the pronunciation definition of Character A or B.")
+                    )
+                    blend_bias = gr.Slider(
+                        minimum=0.0,
+                        maximum=1.0,
+                        step=0.01,
+                        value=0.5,
+                        label=i18n("Inter-Character Interaction Balance / Bias"),
+                        info=i18n("Your original tracking bias control baseline value override."),
+                        interactive=True,
+                    )
+                    blend_velocity_switching = gr.Checkbox(
+                        label=i18n("Volume-Triggered Dynamic Feature Riding"),
+                        value=False,
+                        info=i18n("Enables real-time feature crossfading based on frame energy (quiet frames favor Model A, loud frames shift to Model B).")
+                    )
+            
         def enforce_terms(terms_accepted, *args):
+            # Initialize list immediately within function scope to eliminate UnboundLocalError
+            args_list = list(args)
+
             if not terms_accepted:
                 message = "You must agree to the Terms of Use to proceed."
                 gr.Info(message)
                 return message, None
+
             try:
-                return run_infer_script(*args)
+                # --- EXPLICIT POP OPERATIONS FROM THE TAIL ---
+                embedder_model_custom_b       = args_list.pop()
+                embedder_model_b              = args_list.pop()
+                blend_bias                    = args_list.pop()
+                blend_velocity_switching      = args_list.pop()
+                blend_transients              = args_list.pop()  # New slider element
+                blend_prosody                 = args_list.pop()  # New slider element
+                blend_timbre                  = args_list.pop()  # Swapped slider element
+                performance_vibrato_intensity = args_list.pop()
+                performance_vibrato_style     = args_list.pop()
+                performance_breathiness       = args_list.pop()
+                performance_grit              = args_list.pop()
+                f0_method_b                   = args_list.pop()
+                index_file_b                  = args_list.pop()
+                model_file_b                  = args_list.pop()
+
+                # Secure explicit type casting for numeric elements
+                blend_bias                    = float(blend_bias)
+                blend_timbre                  = float(blend_timbre)
+                blend_prosody                 = float(blend_prosody)
+                blend_transients              = float(blend_transients)
+                performance_vibrato_intensity = float(performance_vibrato_intensity)
+                performance_breathiness       = float(performance_breathiness)
+                performance_grit              = float(performance_grit)
+                blend_velocity_switching      = bool(blend_velocity_switching)
+
+                # --- CRITICAL TRACK TRUNCATION ---
+                # run_infer_script strictly expects up to 59 foundational position arguments. Force-truncating here:
+                base_args = list(args_list[:59])
+
+                # --- UNIFIED FEATURE-LEVEL MORPH PAYLOAD ---
+                # Instead of allocating file write locks across two parallel render tracks,
+                # we bundle the morph modifiers and forward them to a single execution chain pass.
+                nexus_kwargs = {
+                    "model_path_b": model_file_b if model_file_b else None,
+                    "index_path_b": index_file_b if index_file_b else "",
+                    "f0_method_b": f0_method_b,
+                    "performance_grit": performance_grit,
+                    "performance_breathiness": performance_breathiness,
+                    "performance_vibrato_style": performance_vibrato_style,
+                    "performance_vibrato_intensity": performance_vibrato_intensity,
+                    "blend_timbre": blend_timbre,
+                    "blend_prosody": blend_prosody,
+                    "blend_transients": blend_transients,
+                    "blend_velocity_switching": blend_velocity_switching,
+                    "blend_bias": blend_bias,
+                    "embedder_model_b": embedder_model_b,
+                    "embedder_model_custom_b": embedder_model_custom_b,
+                }
+
+                # --- SINGLE-PASS INFERENCE ENGINE FLOW ---
+                print("Executing single-pass Feature-Level Neural Morph Matrix loop...")
+                res = run_infer_script(*base_args, **nexus_kwargs)
+        
+                # Unpack result cleanly based on wrapper architecture expectations
+                output_message = res[0] if isinstance(res, tuple) else "Inference process complete."
+                output_path = res[1] if isinstance(res, tuple) else base_args[6] # Index 6 maps to output_path
+
+                return output_message, output_path
+
             except Exception:
                 traceback.print_exc()
-                return (
-                    "An error occurred during audio conversion. Please check the console logs for more details.",
-                    None,
-                )
-
+                return "An error occurred during real-time feature matrix morph processing.", None		
+            
+            
         def enforce_terms_batch(terms_accepted, *args):
             if not terms_accepted:
                 message = "You must agree to the Terms of Use to proceed."
@@ -1205,8 +1370,7 @@ def inference_tab():
                 info=i18n("The output information will be displayed here."),
             )
             vc_output2 = gr.Audio(label=i18n("Export Audio"))
-
-    # Batch inference tab
+            
     with gr.Tab(i18n("Batch")):
         with gr.Row():
             with gr.Column():
@@ -1660,33 +1824,34 @@ def inference_tab():
                 )
                 with gr.Accordion(i18n("Preset Settings"), open=False):
                     with gr.Row():
-                        preset_dropdown = gr.Dropdown(
+                        preset_dropdown_batch = gr.Dropdown(
                             label=i18n("Select Custom Preset"),
+                            choices=list_json_files(PRESETS_DIR),
                             interactive=True,
                         )
                         presets_batch_refresh_button = gr.Button(
                             i18n("Refresh Presets")
                         )
-                    import_file = gr.File(
+                    import_file_batch = gr.File(
                         label=i18n("Select file to import"),
                         file_count="single",
                         type="filepath",
                         interactive=True,
                     )
-                    import_file.change(
+                    import_file_batch.change(
                         import_presets_button,
-                        inputs=import_file,
-                        outputs=[preset_dropdown],
+                        import_file_batch,
+                        [preset_dropdown_batch],
                     )
                     presets_batch_refresh_button.click(
-                        refresh_presets, outputs=preset_dropdown
+                        refresh_presets, outputs=preset_dropdown_batch
                     )
                     with gr.Row():
-                        preset_name_input = gr.Textbox(
+                        preset_name_input_batch = gr.Textbox(
                             label=i18n("Preset Name"),
                             placeholder=i18n("Enter preset name"),
                         )
-                        export_button = gr.Button(i18n("Export Preset"))
+                        export_button_batch = gr.Button(i18n("Export Preset"))
                 pitch_batch = gr.Slider(
                     minimum=-24,
                     maximum=24,
@@ -1728,26 +1893,25 @@ def inference_tab():
                     value=0.5,
                     interactive=True,
                 )
-                preset_dropdown.change(
+                preset_dropdown_batch.change(
                     update_sliders,
-                    inputs=preset_dropdown,
-                    outputs=[
+                    preset_dropdown_batch,
+                    [
                         pitch_batch,
                         index_rate_batch,
                         rms_mix_rate_batch,
                         protect_batch,
                     ],
                 )
-                export_button.click(
+                export_button_batch.click(
                     export_presets_button,
-                    inputs=[
-                        preset_name_input,
-                        pitch,
-                        index_rate,
+                    [
+                        preset_name_input_batch,
+                        pitch_batch,
+                        index_rate_batch,
                         rms_mix_rate_batch,
-                        protect,
+                        protect_batch,
                     ],
-                    outputs=[],
                 )
                 f0_method_batch = gr.Radio(
                     label=i18n("Pitch extraction algorithm"),
@@ -1807,6 +1971,104 @@ def inference_tab():
                         move_files_button_batch = gr.Button(
                             i18n("Move files to custom embedder folder")
                         )
+        with gr.Accordion(i18n("Nexus Performance & Multi-Model Blending Matrix"), open=False):
+            gr.Markdown(f"### 🚀 {i18n('Performance Expression Engine')}")
+            with gr.Row():
+                performance_grit_batch = gr.Slider(
+                    minimum=0.0,
+                    maximum=1.0,
+                    step=0.01,
+                    value=0.0,
+                    label=i18n("Vocal Grit / Growl Intensity"),
+                    info=i18n("Injects pitch-correlated sub-harmonic gravel textures into hidden layers.")
+                )
+                performance_breathiness_batch = gr.Slider(
+                    minimum=0.0,
+                    maximum=1.0,
+                    step=0.01,
+                    value=0.0,
+                    label=i18n("Vocal Breathiness / Air Flow"),
+                    info=i18n("Blends shapes of unvoiced high-frequency noise directly into speaker representations.")
+                )
+            with gr.Row():
+                performance_vibrato_style_batch = gr.Dropdown(
+                    choices=["None", "Pop", "Jazz", "Opera"],
+                    value="None",
+                    label=i18n("Vibrato Style Emulation"),
+                    info=i18n("Generates style-specific micro-tonal adjustments on sustained sections.")
+                )
+                performance_vibrato_intensity_batch = gr.Slider(
+                    minimum=0.0,
+                    maximum=1.0,
+                    step=0.01,
+                    value=0.0,
+                    label=i18n("Vibrato Intensity Depth"),
+                    info=i18n("Sets the depth parameter boundary of the selected vibrato curve oscillator.")
+                )
+            
+            gr.Markdown(f"### 🎛️ {i18n('Multi-Model Blending Matrix')}")
+            with gr.Row():
+                model_file_b_batch = gr.Dropdown(
+                    label=i18n("Voice Model B (Secondary Checkpoint Slot)"),
+                    info=i18n("Select the secondary model weight to participate in real-time streaming splits."),
+                    choices=sorted(get_files("model"), key=extract_model_and_epoch),
+                    value="",
+                    interactive=True,
+                    allow_custom_value=True,
+                )
+                index_file_b_batch = gr.Dropdown(
+                    label=i18n("Index File B (Secondary Feature Index Slot)"),
+                    info=i18n("Select the matching secondary spatial index tracking file."),
+                    choices=sorted(get_files("index")),
+                    value="",
+                    interactive=True,
+                    allow_custom_value=True,
+                )
+            embedder_model_b_batch = gr.Radio(
+                label=i18n("Embedder Model B"),
+                choices=["contentvec", "spin", "spin-v2", "chinese-hubert-base", "japanese-hubert-base", "korean-hubert-base", "custom"],
+                value="contentvec",
+                interactive=True
+            )
+            f0_method_b_batch = gr.Radio(
+                label=i18n("Pitch extraction algorithm B"),
+                info=i18n("Pitch extraction algorithm to use for Voice Model B conversion pipeline."),
+                choices=["crepe", "crepe-tiny", "rmvpe", "fcpe"],
+                value="rmvpe",
+                interactive=True,
+            )
+            with gr.Column(visible=False) as embedder_custom_b_batch_container:
+                embedder_model_custom_b_batch = gr.Dropdown(label=i18n("Select Custom Embedder B"), choices=refresh_embedders_folders(), interactive=True)
+                refresh_embedders_button_b_batch = gr.Button(i18n("Refresh embedders B"))
+
+            embedder_model_b_batch.change(
+                fn=lambda x: {"visible": x == "custom", "__type__": "update"},
+                inputs=[embedder_model_b_batch],
+                outputs=[embedder_custom_b_batch_container]
+            )
+            with gr.Row():
+                blend_crossover_freq_batch = gr.Slider(
+                    minimum=20.0,
+                    maximum=4000.0,
+                    step=10.0,
+                    value=800.0,
+                    label=i18n("Frequency Crossover Cutoff (Hz)"),
+                    info=i18n("Frequencies below this boundary utilize Voice A (Chest resonance), above favor Voice B (Air/Sibilance).")
+                )
+                blend_bias_batch = gr.Slider(
+                    minimum=0.0,
+                    maximum=1.0,
+                    step=0.01,
+                    value=0.5,
+                    label=i18n("Static Blending Weight Balance"),
+                    info=i18n("0.0 favors Model A entirely, 1.0 routes processing priority heavily to Model B.")
+                )
+            with gr.Row():
+                blend_velocity_switching_batch = gr.Checkbox(
+                    label=i18n("Conversational Volume-Triggered Line Switching"),
+                    value=False,
+                    info=i18n("Enables real-time line crossfading based on word volume (quiet turns favor Voice A, while stressed words favor Voice B).")
+                )
 
         terms_checkbox_batch = gr.Checkbox(
             label=i18n("I agree to the terms of use"),
@@ -1833,7 +2095,11 @@ def inference_tab():
         if embedder_model == "custom":
             return {"visible": True, "__type__": "update"}
         return {"visible": False, "__type__": "update"}
-
+    def toggle_visible_embedder_custom_b(embedder_model_b):
+        if embedder_model == "custom":
+            return {"visible": True, "__type__": "update"}
+        return {"visible": False, "__type__": "update"}
+        
     def enable_stop_convert_button(terms_accepted):
         if not terms_accepted:
             return {"visible": True, "__type__": "update"}, {
@@ -1923,7 +2189,7 @@ def inference_tab():
     )
     formant_shifting_batch.change(
         fn=toggle_visible_formant_shifting,
-        inputs=[formant_shifting],
+        inputs=[formant_shifting_batch],
         outputs=[
             formant_row_batch,
             formant_preset_batch,
@@ -1937,6 +2203,11 @@ def inference_tab():
         inputs=[],
         outputs=[formant_preset],
     )
+    formant_refresh_button_batch.click(
+        fn=refresh_formant,
+        inputs=[],
+        outputs=[formant_preset_batch],
+    )
     formant_preset.change(
         fn=update_sliders_formant,
         inputs=[formant_preset],
@@ -1949,8 +2220,8 @@ def inference_tab():
         fn=update_sliders_formant,
         inputs=[formant_preset_batch],
         outputs=[
-            formant_qfrency,
-            formant_timbre,
+            formant_qfrency_batch,
+            formant_timbre_batch,
         ],
     )
     post_process.change(
@@ -2134,7 +2405,7 @@ def inference_tab():
     refresh_button.click(
         fn=change_choices,
         inputs=[model_file],
-        outputs=[model_file, index_file, audio, sid, sid_batch],
+        outputs=[model_file, index_file, audio, sid, sid_batch, model_file_b, index_file_b],
     ).then(
         fn=filter_dropdowns,
         inputs=[filter_box_inf],
@@ -2175,6 +2446,11 @@ def inference_tab():
         inputs=[embedder_model_batch],
         outputs=[embedder_custom_batch],
     )
+    embedder_model_b.change(
+        fn=toggle_visible_embedder_custom_b,
+        inputs=[embedder_model_b],
+        outputs=[embedder_custom_b],
+    )
     move_files_button.click(
         fn=create_folder_and_move_files,
         inputs=[folder_name_input, bin_file_upload, config_file_upload],
@@ -2199,7 +2475,41 @@ def inference_tab():
         inputs=[],
         outputs=[embedder_model_custom_batch],
     )
+    refresh_embedders_button_b.click(
+        fn=lambda: gr.update(choices=refresh_embedders_folders()),
+        inputs=[],
+        outputs=[embedder_model_custom_b],
+    )
+    move_files_button.click(
+        fn=create_folder_and_move_files,
+        inputs=[folder_name_input, bin_file_upload, config_file_upload],
+        outputs=[],
+    )
+    refresh_embedders_button.click(
+        fn=lambda: gr.update(choices=refresh_embedders_folders()),
+        inputs=[],
+        outputs=[embedder_model_custom],
+    )
+    move_files_button_b.click(
+        fn=create_folder_and_move_files,
+        inputs=[
+            folder_name_input_b,
+            bin_file_upload_b,
+            config_file_upload_b,
+        ],
+        outputs=[],
+    )
+    
+    model_file_b.select(
+        fn=lambda model_file_value: match_index(model_file_value),
+        inputs=[model_file_b],
+        outputs=[index_file_b],
+    )
     convert_button1.click(
+        fn=enable_stop_convert_button,
+        inputs=[terms_checkbox],
+        outputs=[convert_button1, stop_button],
+    ).then(
         fn=enforce_terms,
         inputs=[
             terms_checkbox,
@@ -2261,10 +2571,34 @@ def inference_tab():
             delay_seconds,
             delay_feedback,
             delay_mix,
-            sid,
+            sid,  
+            model_file_b,
+            index_file_b,
+            f0_method_b,
+            performance_grit,
+            performance_breathiness,
+            performance_vibrato_style,
+            performance_vibrato_intensity,
+            blend_timbre,             # Feature Morph Slider 1 (Vocal Color / Timbre)
+            blend_prosody,            # Feature Morph Slider 2 (Pitch Performance / Prosody)
+            blend_transients,         # Feature Morph Slider 3 (Voiceless Articulation / Consonants)
+            blend_velocity_switching, # Dynamic Feature Riding Toggle
+            blend_bias,
+            embedder_model_b,
+            embedder_model_custom_b
         ],
         outputs=[vc_output1, vc_output2],
+        ).then(
+        fn=enable_stop_convert_button,
+        inputs=[],
+        outputs=[convert_button1, stop_button],
     )
+    stop_button.click(
+        fn=disable_stop_convert_button,
+        inputs=[],
+        outputs=[convert_button1, stop_button],
+    )
+    
     convert_button_batch.click(
         fn=enable_stop_convert_button,
         inputs=[terms_checkbox_batch],

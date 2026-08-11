@@ -19,14 +19,6 @@ from assets.i18n.i18n import I18nAuto
 
 i18n = I18nAuto()
 
-
-def progress_str(remaining, total):
-    pct = max(0, min(100, int((total - remaining) / total * 100))) if total > 0 else 0
-    filled = "█" * (pct // 10)
-    empty = "░" * (10 - pct // 10)
-    return f"[{filled}{empty}] {pct}%"
-
-
 model_root = os.path.join(now_dir, "logs")
 custom_embedder_root = os.path.join(
     now_dir, "rvc", "models", "embedders", "embedders_custom"
@@ -524,7 +516,6 @@ def start_realtime(
         )
         return
 
-    print(f"Starting Realtime...")
     yield "Starting Realtime...", interactive_false, interactive_visible
 
     sid = int(sid) if sid is not None else 0
@@ -541,7 +532,6 @@ def start_realtime(
             output_devices[monitor_output_device] if use_monitor_device else None
         )
     except (ValueError, IndexError):
-        print(f"Error: incorrectly formatted audio device.")
         yield "Incorrectly formatted audio device. Stopping.", interactive_true, interactive_false
         return
 
@@ -552,11 +542,11 @@ def start_realtime(
     audio_sample_rate = resolve_sample_rate(
         input_device_id, asio_enabled, audio_sample_rate
     )
-    block_frame = int(chunk_size * audio_sample_rate / 1000)
+    read_chunk_size = int(chunk_size * audio_sample_rate / 1000 / 128)
 
     callbacks_kwargs = {
         "pass_through": PASS_THROUGH,
-        "block_frame": block_frame,
+        "read_chunk_size": read_chunk_size,
         "cross_fade_overlap_size": cross_fade_overlap_size,
         "extra_convert_size": extra_convert_size,
         "model_path": pth_path,
@@ -639,62 +629,36 @@ def start_realtime(
             asio_input_channel=input_asio_channels if asio_enabled else -1,
             asio_output_channel=output_asio_channels if asio_enabled else -1,
             asio_output_monitor_channel=monitor_asio_channels if asio_enabled else -1,
-            block_frame=block_frame,
+            read_chunk_size=read_chunk_size,
             audio_sample_rate=audio_sample_rate,
             asio_output_stereo=asio_output_stereo,
         )
     except Exception as error:
         running = False
-        print(f"Realtime error: {error}")
-        yield "Error: " + str(error), interactive_true, interactive_false
+        yield str(error), interactive_true, interactive_false
         return
 
-    # print(f"Loading model...")
-    # yield "Loading model...", interactive_false, interactive_visible
-
-    # # Wait for the worker process to finish loading the model
-    # load_start = time.time()
-    # last_report = 0
-    # while running and callbacks is not None:
-    #     time.sleep(0.1)
-    #     if not callbacks.vc._process.is_alive():
-    #         print(f"Worker process died during model loading.")
-    #         yield "Worker process crashed during model loading.", interactive_true, interactive_false
-    #         return
-    #     if callbacks.vc.ready:
-    #         break
-    #     if time.time() - load_start > 300:
-    #         print(f"Model loading timed out.")
-    #         yield "Model loading timed out.", interactive_true, interactive_false
-    #         return
-    #     elapsed = int(time.time() - load_start)
-    #     if elapsed > last_report:
-    #         last_report = elapsed
-    #         print(f"Loading model... ({elapsed}s)")
-
-    print(f"Realtime is starting!")
-    yield "Realtime is starting!", interactive_false, interactive_visible
-
-    warmup_total = 0
-    while warmup_total == 0:
-        warmup_total = callbacks.vc.vc_model.warmup_blocks
+    yield "Realtime is ready!", interactive_false, interactive_visible
 
     while running and callbacks is not None and audio_manager is not None:
         time.sleep(0.1)
         if hasattr(audio_manager, "latency") and hasattr(audio_manager, "volume"):
-            warmup_remaining = callbacks.vc.vc_model.warmup_blocks
-
+            warmup_remaining = (
+                callbacks.vc.vc_model.warmup_blocks
+                if callbacks is not None
+                and hasattr(callbacks, "vc")
+                and hasattr(callbacks.vc, "vc_model")
+                and hasattr(callbacks.vc.vc_model, "warmup_blocks")
+                else 0
+            )
             if warmup_remaining > 0:
-                bar = progress_str(warmup_remaining, warmup_total)
-                yield f"Warming up... ({warmup_remaining} blocks) {bar}", interactive_false, interactive_true
+                yield i18n("Warming up... ({} blocks remaining)").format(
+                    warmup_remaining
+                ), interactive_false, interactive_true
             else:
                 yield f"Latency: {audio_manager.latency:.2f} ms | Volume: {audio_manager.volume:.2f} dB", interactive_false, interactive_true
 
-    return (
-        i18n("Realtime stopped."),
-        interactive_true,
-        interactive_false,
-    )
+    return gr.update(), gr.update(), gr.update()
 
 
 def change_callbacks_config():
@@ -704,7 +668,7 @@ def change_callbacks_config():
         # print(callbacks_kwargs)
 
         # It will need to create a new stream to work.
-        # callbacks.vc.block_frame = callbacks_kwargs.get("block_frame", 192)
+        # callbacks.vc.block_frame = callbacks_kwargs.get("read_chunk_size", 192) * 128
         crossfade_frame = int(
             callbacks_kwargs.get("cross_fade_overlap_size", 0.1) * AUDIO_SAMPLE_RATE
         )
@@ -771,9 +735,9 @@ def change_config(value, key, if_kwargs=False):
     global callbacks_kwargs
 
     if running and audio_manager is not None and callbacks is not None:
-        if if_kwargs and value is not None:
+        if if_kwargs:
             callbacks_kwargs["kwargs"][key] = value
-        elif value is not None:
+        else:
             callbacks_kwargs[key] = value
 
         change_callbacks_config()
@@ -791,9 +755,8 @@ def stop_realtime():
         audio_manager = callbacks = None
         time.sleep(0.1)
 
-        print(f"Realtime stopped.")
         return (
-            "Realtime stopped.",
+            "Stopped",
             interactive_true,
             interactive_false,
         )
@@ -2378,7 +2341,7 @@ def realtime_tab():
             outputs=[],
         )
 
-        # chunk_size.change(fn=lambda value: change_config(int(value * AUDIO_SAMPLE_RATE / 1000) if not client_mode else None, "block_frame"), inputs=[chunk_size], outputs=[])
+        # chunk_size.change(fn=lambda value: change_config(int(value * AUDIO_SAMPLE_RATE / 1000 / 128) if not client_mode else None, "read_chunk_size"), inputs=[chunk_size], outputs=[])
 
         pitch.change(
             js=(

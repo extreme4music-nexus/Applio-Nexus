@@ -4,12 +4,7 @@ import multiprocessing
 import os
 import sys
 import time
-
-
-def strtobool(val):
-    """Convert a string representation of truth to a bool."""
-    return val.lower() in ("yes", "true", "t", "y", "1")
-
+from distutils.util import strtobool
 
 import librosa
 import noisereduce as nr

@@ -3,13 +3,8 @@ import os
 import random
 import sys
 import traceback
-import concurrent.futures
+import concurrent
 import gradio as gr
-import librosa
-import numpy as np
-import soundfile as sf
-import shutil
-from scipy import signal
 
 now_dir = os.getcwd()
 sys.path.append(now_dir)
@@ -32,12 +27,14 @@ from tabs.settings.sections.filter import get_filter_trigger, load_config_filter
 
 i18n = I18nAuto()
 
+
 with open(
     os.path.join("rvc", "lib", "tools", "tts_voices.json"), "r", encoding="utf-8"
 ) as file:
     tts_voices_data = json.load(file)
 
 short_names = [voice.get("ShortName", "") for voice in tts_voices_data]
+
 
 def process_input(file_path):
     try:
@@ -66,7 +63,7 @@ def tts_tab():
                 interactive=True,
                 value=default_weight,
                 allow_custom_value=True,
-                )
+            )
             filter_box_tts = gr.Textbox(
                 label=i18n("Filter"),
                 info=i18n("Path must contain:"),
@@ -447,9 +444,6 @@ def tts_tab():
                 label=i18n("Dialogue Crossover Cutoff (Hz)"),
                 info=i18n("Allocates foundational resonance frequencies to Character A and crystal-clear speech elements to Character B.")
             )
-            enable_crossover = gr.Checkbox(label=i18n("Enable Frequency Crossover"), value=True)
-            crossover_mode = gr.Radio(choices=["A-Low/B-High", "B-Low/A-High"], value="A-Low/B-High", label=i18n("Crossover Phase Mapping"))
-            
             blend_bias = gr.Slider(
                 minimum=0.0,
                 maximum=1.0,
@@ -465,8 +459,10 @@ def tts_tab():
                 info=i18n("Enables real-time line crossfading based on word volume (quiet turns favor Voice A, while stressed words favor Voice B).")
             )
             
+    # Clean architecture: Explicitly name parameters and match the argument signature perfectly
     def enforce_terms(terms_accepted, *args):
-        args_list = list(args[:40])
+        # Clamp the input list to exactly 38 elements to drop hidden Gradio layout footprints
+        args_list = list(args[:38])
     
         if not terms_accepted:
             message = "You must agree to the Terms of Use to proceed."
@@ -474,32 +470,34 @@ def tts_tab():
             return message, None
 
         try:
-            embedder_model_custom_b       = args_list.pop()
-            embedder_model_b              = args_list.pop()
-            blend_bias                    = args_list.pop()
-            blend_velocity_switching      = args_list.pop()
-            crossover_mode                = args_list.pop()
-            enable_crossover              = args_list.pop()
-            blend_crossover_freq          = args_list.pop()
-            performance_vibrato_intensity = args_list.pop()
-            performance_vibrato_style     = args_list.pop()
-            performance_breathiness       = args_list.pop()
-            performance_grit              = args_list.pop()
-            f0_method_b                   = args_list.pop()
-            index_file_b                  = args_list.pop()
-            model_file_b                  = args_list.pop()
+            # --- SAFE POP UNPACKING FROM CLAMPED LIST ---
+            embedder_model_custom_b       = args_list.pop() # Index 37
+            embedder_model_b              = args_list.pop() # Index 36
+            blend_bias                    = args_list.pop() # Index 35
+            blend_velocity_switching      = args_list.pop() # Index 34
+            blend_crossover_freq          = args_list.pop() # Index 33
+            performance_vibrato_intensity = args_list.pop() # Index 32
+            performance_vibrato_style     = args_list.pop() # Index 31
+            performance_breathiness       = args_list.pop() # Index 30
+            performance_grit              = args_list.pop() # Index 29
+            f0_method_b                   = args_list.pop() # Index 28
+            index_file_b                  = args_list.pop() # Index 27
+            model_file_b                  = args_list.pop() # Index 26
 
+            # Type cast variables cleanly now that alignment is secure
             blend_bias                    = float(blend_bias)
-            enable_crossover              = bool(enable_crossover)
             blend_crossover_freq          = float(blend_crossover_freq)
             performance_vibrato_intensity = float(performance_vibrato_intensity)
             performance_breathiness       = float(performance_breathiness)
             performance_grit              = float(performance_grit)
             blend_velocity_switching      = bool(blend_velocity_switching)
 
+            # --- CRITICAL TRACK TRUNCATION ---
+            # run_tts_script strictly expects up to 24 arguments. Force-truncating here:
             base_tts_args = list(args_list[:24])
-            original_rvc_path = base_tts_args[11] 
+            original_rvc_path = base_tts_args[11]
 
+            # Build isolated thread paths
             base_dir = os.path.dirname(original_rvc_path)
             file_name = os.path.basename(original_rvc_path)
             path_worker_a = os.path.join(base_dir, f"tts_worker_a_{file_name}")
@@ -510,90 +508,61 @@ def tts_tab():
 
             args_worker_b = list(base_tts_args)
             args_worker_b[11] = path_worker_b
-        
-            args_worker_b[9] = f0_method_b              
-            args_worker_b[11] = path_worker_b           
-            args_worker_b[12] = model_file_b            
-            args_worker_b[13] = index_file_b            
-            args_worker_b[22] = embedder_model_b        
-            args_worker_b[23] = embedder_model_custom_b 
 
             nexus_kwargs = {
+                "net_g_path": model_file_b if model_file_b else None,
+                "file_index_path": index_file_b if index_file_b else "",
+                "f0_method": f0_method_b,
                 "performance_grit": performance_grit,
                 "performance_breathiness": performance_breathiness,
                 "performance_vibrato_style": performance_vibrato_style,
                 "performance_vibrato_intensity": performance_vibrato_intensity,
+                "blend_crossover_freq": blend_crossover_freq,
+                "blend_velocity_switching": blend_velocity_switching,
+                "blend_bias": blend_bias,
+                "embedder_model": embedder_model_b,
+                "embedder_model_custom": embedder_model_custom_b
             }
-        
-            print("Executing TTS Worker A sequential rendering loop...")
-            info_text_a, actual_path_a = run_tts_script(*args_worker_a)
-            if not actual_path_a or not os.path.exists(path_worker_a):
-                actual_path_a = path_worker_a
 
-            if model_file_b:
-                print("Executing TTS Worker B sequential rendering loop with Nexus parameters...")
-                info_text_b, actual_path_b = run_tts_script(*args_worker_b, **nexus_kwargs)
-                if not actual_path_b or not os.path.exists(path_worker_b):
-                    actual_path_b = path_worker_b
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                future_a = executor.submit(run_tts_script, *args_worker_a)
 
-                print("Applying Butterworth Crossover & Dynamic Envelope Blending...")
-                audio_a, sr = librosa.load(actual_path_a, sr=None)
-                audio_b, _ = librosa.load(actual_path_b, sr=sr)
-
-                min_len = min(len(audio_a), len(audio_b))
-                audio_a, audio_b = audio_a[:min_len], audio_b[:min_len]
-                
-                audio_a_filtered = audio_a
-                audio_b_filtered = audio_b
-
-                if enable_crossover:
-                    nyquist = sr * 0.5
-                    clamped_crossover = np.clip(blend_crossover_freq, 100.0, nyquist - 100.0)
-                    Wn = clamped_crossover / nyquist
-                    b_low, a_low = signal.butter(4, Wn, btype='low')
-                    b_high, a_high = signal.butter(4, Wn, btype='high')
-                    
-                    if crossover_mode == "A-Low/B-High":
-                        audio_a_filtered = signal.filtfilt(b_low, a_low, audio_a)
-                        audio_b_filtered = signal.filtfilt(b_high, a_high, audio_b)
-                    else:
-                        audio_a_filtered = signal.filtfilt(b_high, a_high, audio_a)
-                        audio_b_filtered = signal.filtfilt(b_low, a_low, audio_b)
-
-                if blend_velocity_switching:
-                    rms = librosa.feature.rms(y=audio_a, frame_length=2048, hop_length=512)[0]
-                    rms_norm = (rms - np.min(rms)) / (np.ptp(rms) + 1e-8)
-                    times_rms = np.linspace(0, min_len, len(rms_norm))
-                    dynamic_envelope = np.interp(np.arange(min_len), times_rms, rms_norm)
-                    active_bias = np.clip((blend_bias * 0.4) + (dynamic_envelope * 0.6), 0.0, 1.0)
+                if model_file_b:
+                    future_b = executor.submit(run_tts_script, *args_worker_b, **nexus_kwargs)
                 else:
-                    active_bias = blend_bias
+                    future_b = None
 
-                gain_a = (1.0 - active_bias) * 2.0
-                gain_b = active_bias * 2.0
-                blended_audio = (audio_a_filtered * gain_a) + (audio_b_filtered * gain_b)
+                res_a = future_a.result()
+                actual_path_a = res_a[1] if isinstance(res_a, tuple) else path_worker_a
 
-                max_amp = np.max(np.abs(blended_audio))
-                if max_amp > 0.99:
-                    blended_audio = (blended_audio / max_amp) * 0.99
+                if future_b:
+                    res_b = future_b.result()
+                    actual_path_b = res_b[1] if isinstance(res_b, tuple) else path_worker_b
 
-                sf.write(original_rvc_path, blended_audio, sr)
+                    audio_a, sr = librosa.load(actual_path_a, sr=None)
+                    audio_b, _ = librosa.load(actual_path_b, sr=sr)
 
-                for path_temp in [actual_path_a, actual_path_b]:
-                    if os.path.exists(path_temp):
-                        os.remove(path_temp)
+                    min_len = min(len(audio_a), len(audio_b))
+                    audio_a, audio_b = audio_a[:min_len], audio_b[:min_len]
 
-                return "TTS Sequential execution and crossover blending complete.", original_rvc_path
+                    blended_audio = (audio_a * (1.0 - blend_bias)) + (audio_b * blend_bias)
+                    sf.write(original_rvc_path, blended_audio, sr)
 
-            if os.path.exists(path_worker_a):
-                if os.path.exists(original_rvc_path):
-                    os.remove(original_rvc_path)
-                shutil.move(path_worker_a, original_rvc_path)
-            return "Primary TTS model inference complete.", original_rvc_path
+                    for path_temp in [actual_path_a, actual_path_b]:
+                        if os.path.exists(path_temp):
+                            os.remove(path_temp)
+
+                    return "Parallel execution and blending complete.", original_rvc_path
+
+                if os.path.exists(path_worker_a):
+                    if os.path.exists(original_rvc_path):
+                        os.remove(original_rvc_path)
+                    shutil.move(path_worker_a, original_rvc_path)
+                return "Primary model inference complete.", original_rvc_path
 
         except Exception:
             traceback.print_exc()
-            return "An error occurred during sequential TTS synthesis processing.", None
+            return "An error occurred during parallel synthesis.", None
             
     terms_checkbox = gr.Checkbox(
         label=i18n("I agree to the terms of use"),
@@ -709,12 +678,10 @@ def tts_tab():
             performance_vibrato_style,      #31
             performance_vibrato_intensity,  #32
             blend_crossover_freq,           #33
-            enable_crossover,               #34
-            crossover_mode,                 #35
-            blend_velocity_switching,       #36
-            blend_bias,                     #37
-            embedder_model_b,               #38
-            embedder_model_custom_b,        #39
+            blend_velocity_switching,       #34
+            blend_bias,                     #35
+            embedder_model_b,               #36
+            embedder_model_custom_b,        #37
         ],
         outputs=[vc_output1, vc_output2],
     )

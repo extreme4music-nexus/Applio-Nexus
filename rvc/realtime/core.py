@@ -31,70 +31,6 @@ SAMPLE_RATE = 16000
 AUDIO_SAMPLE_RATE = 48000
 
 
-def phase_vocoder(a, b, fade_out, fade_in):
-    """
-    Performs a phase vocoder crossfade between two audio segments.
-
-    This function blends segment `a` and segment `b` by aligning their phases
-    in the frequency domain to prevent phase cancellation during the transition,
-    while applying the provided fade-out and fade-in windows.
-
-    Args:
-        a (torch.Tensor): The first audio segment.
-        b (torch.Tensor): The second audio segment.
-        fade_out (torch.Tensor): The fade-out window applied to segment `a`.
-        fade_in (torch.Tensor): The fade-in window applied to segment `b`.
-
-    Returns:
-        torch.Tensor: The crossfaded audio segment.
-    """
-
-    # Compute the analysis window as the geometric mean of fade curves
-    window = (fade_out * fade_in).sqrt()
-    # Transform both windowed segments to the frequency domain (Real FFT)
-    fa = torch.fft.rfft(a * window)
-    fb = torch.fft.rfft(b * window)
-    # Calculate the combined magnitude spectrum
-    absab = fa.abs() + fb.abs()
-    n = a.shape[0]
-
-    # Compensate for the energy of negative frequencies (except DC and Nyquist components)
-    if n % 2 == 0:
-        absab[1:-1] *= 2
-    else:
-        absab[1:] *= 2
-
-    # Extract initial phase and calculate the raw phase difference
-    phia = fa.angle()
-    deltaphase = fb.angle() - phia
-
-    # Reconstruct the signal using a combination of time-domain crossfade
-    # and phase-aligned sinusoidal synthesis (Phase Vocoder)
-    return (
-        a * (fade_out**2)
-        + b * (fade_in**2)
-        + (
-            absab
-            * (
-                (
-                    # Base frequency grid for each bin
-                    2 * torch.pi * torch.arange(n // 2 + 1).to(a)
-                    +
-                    # Phase unwrapping (wrapping delta phase to the [-pi, pi] range)
-                    (
-                        deltaphase
-                        - 2 * torch.pi * (deltaphase / 2 / torch.pi + 0.5).floor()
-                    )
-                )
-                * (torch.arange(n).unsqueeze(-1).to(a) / n)
-                + phia  # Continuous phase evolution over time
-            ).cos()
-        ).sum(-1)
-        * window
-        / n  # Sum the sinusoidal components (IFFT equivalent) and normalize
-    )
-
-
 class Realtime:
     def __init__(
         self,
@@ -440,7 +376,7 @@ class Realtime:
 class VoiceChanger:
     def __init__(
         self,
-        block_frame: int,
+        read_chunk_size: int,
         cross_fade_overlap_size: float,
         extra_convert_size: float,
         model_path: str = None,
@@ -466,7 +402,7 @@ class VoiceChanger:
         self.record_audio = record_audio
         self.record_audio_path = record_audio_path
         self.export_format = export_format
-        self.block_frame = block_frame
+        self.block_frame = read_chunk_size * 128
         self.crossfade_frame = int(cross_fade_overlap_size * AUDIO_SAMPLE_RATE)
         self.extra_frame = int(extra_convert_size * AUDIO_SAMPLE_RATE)
         self.sola_search_frame = AUDIO_SAMPLE_RATE // 100
@@ -549,7 +485,6 @@ class VoiceChanger:
         f0_autotune_strength: float = 1,
         proposed_pitch: bool = False,
         proposed_pitch_threshold: float = 155.0,
-        use_phase_vocoder: bool = True,
     ):
         block_size = audio_input.shape[0]
 
@@ -587,44 +522,32 @@ class VoiceChanger:
 
         audio = audio[sola_offset:]
 
-        if use_phase_vocoder:
-            audio[: self.crossfade_frame] = phase_vocoder(
-                self.sola_buffer,
-                audio[: self.crossfade_frame],
-                self.fade_out_window,
-                self.fade_in_window,
-            )
-        else:
-            if is_onset:
-                # Find voice onset position and apply sin² fade-in, zeroing audio before onset.
-                hop = 160  # ~3.3 ms at 48 kHz
-                n_hops = block_size // hop
-                if n_hops >= 1:
-                    hop_energy = (
-                        audio[: n_hops * hop]
-                        .reshape(n_hops, hop)
-                        .abs()
-                        .max(dim=1)
-                        .values
-                    )
-                    peak = hop_energy.max().item()
-                    onset_sample = 0
-                    if peak > 1e-4:
-                        above = (hop_energy > 0.1 * peak).nonzero(as_tuple=False)
-                        if len(above) > 0:
-                            onset_sample = int(above[0].item()) * hop
-                else:
-                    onset_sample = 0
-                audio[:onset_sample] = 0.0
-                # Apply sin² fade-in over crossfade_frame duration from onset.
-                fade_len = min(block_size - onset_sample, self.crossfade_frame)
-                if fade_len > 0:
-                    audio[
-                        onset_sample : onset_sample + fade_len
-                    ] *= self.fade_in_window[:fade_len]
+        if is_onset:
+            # Find voice onset position and apply sin² fade-in, zeroing audio before onset.
+            hop = 160  # ~3.3 ms at 48 kHz
+            n_hops = block_size // hop
+            if n_hops >= 1:
+                hop_energy = (
+                    audio[: n_hops * hop].reshape(n_hops, hop).abs().max(dim=1).values
+                )
+                peak = hop_energy.max().item()
+                onset_sample = 0
+                if peak > 1e-4:
+                    above = (hop_energy > 0.1 * peak).nonzero(as_tuple=False)
+                    if len(above) > 0:
+                        onset_sample = int(above[0].item()) * hop
             else:
-                audio[: self.crossfade_frame] *= self.fade_in_window
-                audio[: self.crossfade_frame] += self.sola_buffer * self.fade_out_window
+                onset_sample = 0
+            audio[:onset_sample] = 0.0
+            # Apply sin² fade-in over crossfade_frame duration from onset.
+            fade_len = min(block_size - onset_sample, self.crossfade_frame)
+            if fade_len > 0:
+                audio[onset_sample : onset_sample + fade_len] *= self.fade_in_window[
+                    :fade_len
+                ]
+        else:
+            audio[: self.crossfade_frame] *= self.fade_in_window
+            audio[: self.crossfade_frame] += self.sola_buffer * self.fade_out_window
 
         # Pad if audio is shorter than block_size + crossfade_frame.
         _need = block_size + self.crossfade_frame
@@ -653,7 +576,6 @@ class VoiceChanger:
         f0_autotune_strength: float = 1,
         proposed_pitch: bool = False,
         proposed_pitch_threshold: float = 155.0,
-        use_phase_vocoder: bool = True,
     ):
         if self.vc_model is None:
             raise RuntimeError("Voice Changer is not selected.")
@@ -671,7 +593,6 @@ class VoiceChanger:
             f0_autotune_strength,
             proposed_pitch,
             proposed_pitch_threshold,
-            use_phase_vocoder,
         )
         end = time.perf_counter()
 

@@ -94,3 +94,14 @@ Applio is made possible thanks to these projects and their references:
 <a href="https://github.com/IAHispano/Applio/graphs/contributors" target="_blank">
   <img src="https://contrib.rocks/image?repo=IAHispano/Applio" />
 </a>
+
+sudo docker run -d \
+  --name=radarr \
+  --restart=unless-stopped \
+  -e PUID=1000 \
+  -e PGID=1000 \
+  -e TZ=Europe/Skopje \
+  -p 7878:7878 \
+  -v $HOME/Radarr/config:/config \
+  -v /mnt/sdb/NAS/Movies:/movies \
+  linuxserver/radarr:latest

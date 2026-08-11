@@ -32,12 +32,14 @@ from tabs.settings.sections.filter import get_filter_trigger, load_config_filter
 
 i18n = I18nAuto()
 
+
 with open(
     os.path.join("rvc", "lib", "tools", "tts_voices.json"), "r", encoding="utf-8"
 ) as file:
     tts_voices_data = json.load(file)
 
 short_names = [voice.get("ShortName", "") for voice in tts_voices_data]
+
 
 def process_input(file_path):
     try:
@@ -66,7 +68,7 @@ def tts_tab():
                 interactive=True,
                 value=default_weight,
                 allow_custom_value=True,
-                )
+            )
             filter_box_tts = gr.Textbox(
                 label=i18n("Filter"),
                 info=i18n("Path must contain:"),
@@ -83,6 +85,7 @@ def tts_tab():
                 value=match_index(default_weight),
                 interactive=True,
                 allow_custom_value=True,
+                close_on_click=True,
             )
             filter_box_tts.blur(
                 fn=filter_dropdowns,
@@ -336,6 +339,7 @@ def tts_tab():
                             choices=refresh_embedders_folders(),
                             interactive=True,
                             allow_custom_value=True,
+                            close_on_click=True,
                         )
                         refresh_embedders_button = gr.Button(i18n("Refresh embedders"))
                     folder_name_input = gr.Textbox(
@@ -406,6 +410,7 @@ def tts_tab():
                 value="",
                 interactive=True,
                 allow_custom_value=True,
+                close_on_click=True,
             )
             index_file_b = gr.Dropdown(
                 label=i18n("Index File B (Secondary Character Index)"),
@@ -414,6 +419,7 @@ def tts_tab():
                 value="",
                 interactive=True,
                 allow_custom_value=True,
+                close_on_click=True,
             )
         with gr.Row():
             embedder_model_b = gr.Radio(
@@ -430,7 +436,7 @@ def tts_tab():
                 interactive=True,
             )
             with gr.Column(visible=False) as embedder_custom_b_container:
-                embedder_model_custom_b = gr.Dropdown(label=i18n("Select Custom Embedder B"), choices=refresh_embedders_folders(), interactive=True)
+                embedder_model_custom_b = gr.Dropdown(label=i18n("Select Custom Embedder B"), choices=refresh_embedders_folders(), interactive=True, close_on_click=True)
                 refresh_embedders_button_b = gr.Button(i18n("Refresh embedders B"))
 
             embedder_model_b.change(
@@ -465,7 +471,9 @@ def tts_tab():
                 info=i18n("Enables real-time line crossfading based on word volume (quiet turns favor Voice A, while stressed words favor Voice B).")
             )
             
+    # --- COMPLETELY IMPLEMENTED INFERENCE BLENDING CORE LOGIC ---
     def enforce_terms(terms_accepted, *args):
+        # Clamp the input list to exactly 40 elements to drop hidden Gradio layout footprints
         args_list = list(args[:40])
     
         if not terms_accepted:
@@ -474,6 +482,7 @@ def tts_tab():
             return message, None
 
         try:
+            # --- EXPLICIT POP OPERATIONS FROM THE TAIL ---
             embedder_model_custom_b       = args_list.pop()
             embedder_model_b              = args_list.pop()
             blend_bias                    = args_list.pop()
@@ -489,6 +498,7 @@ def tts_tab():
             index_file_b                  = args_list.pop()
             model_file_b                  = args_list.pop()
 
+            # Secure explicit type casting for numeric elements
             blend_bias                    = float(blend_bias)
             enable_crossover              = bool(enable_crossover)
             blend_crossover_freq          = float(blend_crossover_freq)
@@ -497,34 +507,43 @@ def tts_tab():
             performance_grit              = float(performance_grit)
             blend_velocity_switching      = bool(blend_velocity_switching)
 
+            # --- CRITICAL TRACK TRUNCATION ---
+            # run_tts_script strictly expects up to 24 positional core parameters.
             base_tts_args = list(args_list[:24])
-            original_rvc_path = base_tts_args[11] 
+            original_rvc_path = base_tts_args[11] # Index 11 maps to output_rvc_path in tts wrapper
 
+            # Build independent target paths to isolate file creation loops
             base_dir = os.path.dirname(original_rvc_path)
             file_name = os.path.basename(original_rvc_path)
             path_worker_a = os.path.join(base_dir, f"tts_worker_a_{file_name}")
             path_worker_b = os.path.join(base_dir, f"tts_worker_b_{file_name}")
 
+            # Task Allocation Worker A (Primary Model Configuration)
             args_worker_a = list(base_tts_args)
             args_worker_a[11] = path_worker_a
 
+            # Task Allocation Worker B (Secondary Model/Nexus Configuration)
             args_worker_b = list(base_tts_args)
             args_worker_b[11] = path_worker_b
         
-            args_worker_b[9] = f0_method_b              
-            args_worker_b[11] = path_worker_b           
-            args_worker_b[12] = model_file_b            
-            args_worker_b[13] = index_file_b            
-            args_worker_b[22] = embedder_model_b        
-            args_worker_b[23] = embedder_model_custom_b 
+            # --- FIXED POSITION-BASED DIRECT OVERRIDES ---
+            # Directly updating positional parameters to prevent wrapper dictionary updates from losing these keys
+            args_worker_b[9] = f0_method_b              # Index 9: f0_method
+            args_worker_b[11] = path_worker_b           # Index 11: output_rvc_path
+            args_worker_b[12] = model_file_b            # Index 12: model_file
+            args_worker_b[13] = index_file_b            # Index 13: index_file
+            args_worker_b[22] = embedder_model_b        # Index 22: embedder_model
+            args_worker_b[23] = embedder_model_custom_b # Index 23: embedder_model_custom
 
+            # Construct Dialogue Performance Engine payload configuration
             nexus_kwargs = {
                 "performance_grit": performance_grit,
                 "performance_breathiness": performance_breathiness,
                 "performance_vibrato_style": performance_vibrato_style,
                 "performance_vibrato_intensity": performance_vibrato_intensity,
             }
-        
+
+            # --- SEQUENTIAL DISPATCH ENGINE FLOW ---
             print("Executing TTS Worker A sequential rendering loop...")
             info_text_a, actual_path_a = run_tts_script(*args_worker_a)
             if not actual_path_a or not os.path.exists(path_worker_a):
@@ -536,6 +555,7 @@ def tts_tab():
                 if not actual_path_b or not os.path.exists(path_worker_b):
                     actual_path_b = path_worker_b
 
+                # --- ADVANCED DSP BLENDING LAYER ---
                 print("Applying Butterworth Crossover & Dynamic Envelope Blending...")
                 audio_a, sr = librosa.load(actual_path_a, sr=None)
                 audio_b, _ = librosa.load(actual_path_b, sr=sr)
@@ -543,9 +563,11 @@ def tts_tab():
                 min_len = min(len(audio_a), len(audio_b))
                 audio_a, audio_b = audio_a[:min_len], audio_b[:min_len]
                 
+                # Initialize variables to raw audio to prevent UnboundLocalError
                 audio_a_filtered = audio_a
                 audio_b_filtered = audio_b
 
+                # 1. Zero-Phase Butterworth Crossover Filtering
                 if enable_crossover:
                     nyquist = sr * 0.5
                     clamped_crossover = np.clip(blend_crossover_freq, 100.0, nyquist - 100.0)
@@ -553,6 +575,7 @@ def tts_tab():
                     b_low, a_low = signal.butter(4, Wn, btype='low')
                     b_high, a_high = signal.butter(4, Wn, btype='high')
                     
+                    # APPLY PHASE FLIP: A-Low/B-High OR B-Low/A-High
                     if crossover_mode == "A-Low/B-High":
                         audio_a_filtered = signal.filtfilt(b_low, a_low, audio_a)
                         audio_b_filtered = signal.filtfilt(b_high, a_high, audio_b)
@@ -560,6 +583,7 @@ def tts_tab():
                         audio_a_filtered = signal.filtfilt(b_high, a_high, audio_a)
                         audio_b_filtered = signal.filtfilt(b_low, a_low, audio_b)
 
+                # 2. Dynamic Volume-Triggered Velocity Switching
                 if blend_velocity_switching:
                     rms = librosa.feature.rms(y=audio_a, frame_length=2048, hop_length=512)[0]
                     rms_norm = (rms - np.min(rms)) / (np.ptp(rms) + 1e-8)
@@ -569,10 +593,12 @@ def tts_tab():
                 else:
                     active_bias = blend_bias
 
+                # 3. Final Composite Mix
                 gain_a = (1.0 - active_bias) * 2.0
                 gain_b = active_bias * 2.0
                 blended_audio = (audio_a_filtered * gain_a) + (audio_b_filtered * gain_b)
 
+                # Anti-clipping peak normalization
                 max_amp = np.max(np.abs(blended_audio))
                 if max_amp > 0.99:
                     blended_audio = (blended_audio / max_amp) * 0.99
